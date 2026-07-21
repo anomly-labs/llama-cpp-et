@@ -566,6 +566,107 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// ============================================================================
+// b-posit8 W8A8 (Anomly) — exact-quire, power-of-two block scale.
+// Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bruscoe.
+// Reproducibility-first: the block scale is a power-of-two EXPONENT (exact
+// bit-shift, bit-identical across GPU/CPU/RISC-V), never a float multiply.
+// The decode is the verified bp8_codec (ES=2, useed=16); encode is
+// round-to-nearest over the decoded value grid (the accuracy-optimal choice,
+// per the measured W8A8 rounding study).
+// ============================================================================
+#define BP8_ES     2
+#define BP8_ZERO   0x00
+#define BP8_NAR    0x80
+
+// decode one bp8 code to its exact dyadic value (double). Zero/NaR -> 0.
+static double ggml_bp8_code_to_double(uint8_t p) {
+    if (p == BP8_ZERO || p == BP8_NAR) return 0.0;
+    int s = (p >> 7) & 1;
+    int rest = p & 0x7F;
+    if (s) rest = ((~rest) + 1) & 0x7F;              // two's complement of trailing 7 bits
+    int leading = (rest >> 6) & 1;
+    int rs = 0;
+    while (rs < 7 && ((rest >> (6 - rs)) & 1) == leading) rs++;
+    int k_reg, e = 0, fb = 0, fw = 0;
+    if (rs == 7) {
+        k_reg = leading ? 6 : -7;
+    } else {
+        k_reg = leading ? (rs - 1) : -rs;
+        int rem = 7 - (rs + 1);
+        int r2  = rest & ((1 << rem) - 1);
+        int ew  = BP8_ES < rem ? BP8_ES : rem;
+        if (ew > 0) { e = (r2 >> (rem - ew)) & ((1 << ew) - 1); e <<= (BP8_ES - ew); }
+        rem -= ew; fw = rem; fb = fw > 0 ? (r2 & ((1 << fw) - 1)) : 0;
+    }
+    double m = (double)((1 << fw) + fb);             // >= 1
+    int    E = 4 * k_reg + e - fw;                    // useed=16=2^4 -> 4*k
+    return (s ? -m : m) * ldexp(1.0, E);             // m * 2^E
+}
+
+// decoded value grid, built once (thread-safe enough: idempotent fill).
+static double g_bp8_val[256];
+static int    g_bp8_ready = 0;
+static void ggml_bp8_init(void) {
+    if (g_bp8_ready) return;
+    for (int c = 0; c < 256; c++) g_bp8_val[c] = ggml_bp8_code_to_double((uint8_t) c);
+    g_bp8_ready = 1;
+}
+
+// round-to-nearest encode: the finite bp8 code whose value is closest to x.
+static uint8_t ggml_bp8_encode_nearest(double x) {
+    ggml_bp8_init();
+    if (x == 0.0) return BP8_ZERO;
+    uint8_t best = BP8_ZERO;
+    double  bestd = INFINITY;
+    for (int c = 0; c < 256; c++) {
+        if (c == BP8_NAR) continue;                  // NaR is never a quantization target
+        double d = fabs(g_bp8_val[c] - x);
+        if (d < bestd) { bestd = d; best = (uint8_t) c; }
+    }
+    return best;
+}
+
+void quantize_row_bposit8_ref(const float * GGML_RESTRICT x, block_bposit8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BPOSIT8 == 0);
+    const int nb = k / QK_BPOSIT8;
+    ggml_bp8_init();
+    for (int i = 0; i < nb; i++) {
+        // power-of-two block scale: center the block on b-posit's dense ~1.0 band via RMS,
+        // rounded to an integer exponent (exact bit-shift -> reproducible on any hardware).
+        double sumsq = 0.0;
+        for (int j = 0; j < QK_BPOSIT8; j++) {
+            const double v = (double) x[i*QK_BPOSIT8 + j];
+            sumsq += v * v;
+        }
+        const double rms = sqrt(sumsq / QK_BPOSIT8);
+        int se = 0;
+        if (rms > 0.0) {
+            se = (int) lrint(log2(rms));
+            if (se >  127) se =  127;
+            if (se < -128) se = -128;
+        }
+        y[i].scale_exp = (int8_t) se;
+        const double inv = ldexp(1.0, -se);          // 2^-se
+        for (int j = 0; j < QK_BPOSIT8; j++) {
+            y[i].qs[j] = ggml_bp8_encode_nearest((double) x[i*QK_BPOSIT8 + j] * inv);
+        }
+    }
+}
+
+void dequantize_row_bposit8(const block_bposit8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_BPOSIT8;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    ggml_bp8_init();
+    for (int i = 0; i < nb; i++) {
+        const double sc = ldexp(1.0, x[i].scale_exp); // 2^scale_exp
+        for (int j = 0; j < qk; j++) {
+            y[i*qk + j] = (float) (g_bp8_val[x[i].qs[j]] * sc);
+        }
+    }
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 

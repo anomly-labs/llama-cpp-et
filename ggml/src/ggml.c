@@ -741,6 +741,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_BPOSIT8] = { // b-posit8 W8A8 (Anomly): exact-quire, power-of-two block scale
+        .type_name                = "bposit8",
+        .blck_size                = QK_BPOSIT8,
+        .type_size                = sizeof(block_bposit8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_bposit8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_bposit8_ref,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
