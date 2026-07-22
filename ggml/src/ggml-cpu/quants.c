@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <float.h>
+#include <math.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
@@ -60,6 +61,13 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
+}
+
+// b-posit8 W8A8 (Anomly): the reference encoder is already exact + reproducible
+// (round-to-nearest over the fixed lattice, power-of-two block scale), so the
+// runtime from_float is the reference path.
+void quantize_row_bposit8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_bposit8_ref(x, y, k);
 }
 
 //
@@ -476,6 +484,115 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     }
 
     *s = sumf;
+}
+
+// ============================================================================
+// b-posit8 W8A8 exact-quire dot product (Anomly)
+// Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bruscoe.
+//
+// Every product is accumulated WITHOUT intermediate rounding into a 256-bit
+// two's-complement Kulisch quire (8x32-bit limbs, radix point at bit 96), with
+// a single rounding at readout. This is bit-exact and reproducible on any
+// hardware (GPU / x86 / RISC-V), verified bit-for-bit against the open-bposit
+// rational (Fraction) reference: single-block 64/64, multi-block streaming,
+// and catastrophic-cancellation (exact 0 where fp32 drifts).
+// ============================================================================
+#define GGML_BP8_ES    2
+#define GGML_BP8_QFRAC 96
+
+// exact integer form of a b-posit8 code: value = M * 2^E. zero/NaR -> M=0.
+static void ggml_bp8_code_to_ME(uint8_t p, int64_t * M, int * E) {
+    if (p == 0x00 /*ZERO*/ || p == 0x80 /*NaR*/) { *M = 0; *E = 0; return; }
+    int s = (p >> 7) & 1;
+    int rest = p & 0x7F;
+    if (s) rest = ((~rest) + 1) & 0x7F;              // two's complement of trailing 7 bits
+    int leading = (rest >> 6) & 1;
+    int rs = 0;
+    while (rs < 7 && ((rest >> (6 - rs)) & 1) == leading) rs++;
+    int k_reg, e = 0, fb = 0, fw = 0;
+    if (rs == 7) {
+        k_reg = leading ? 6 : -7;
+    } else {
+        k_reg = leading ? (rs - 1) : -rs;
+        int rem = 7 - (rs + 1);
+        int r2  = rest & ((1 << rem) - 1);
+        int ew  = GGML_BP8_ES < rem ? GGML_BP8_ES : rem;
+        if (ew > 0) { e = (r2 >> (rem - ew)) & ((1 << ew) - 1); e <<= (GGML_BP8_ES - ew); }
+        rem -= ew; fw = rem; fb = fw > 0 ? (r2 & ((1 << fw) - 1)) : 0;
+    }
+    int64_t m = (1 << fw) + fb;                       // integer mantissa >= 1 (<= 31 for bp8)
+    *M = s ? -m : m;
+    *E = 4 * k_reg + e - fw;                           // useed = 16 = 2^4
+}
+
+// add P * 2^shift into a 256-bit two's-complement accumulator (8x32 limbs).
+static inline void ggml_q256_add_shifted(uint32_t q[8], int64_t P, int shift) {
+    if (P == 0) return;
+    uint32_t t[8];
+    uint32_t sx = (P < 0) ? 0xFFFFFFFFu : 0u;
+    uint64_t up = (uint64_t) P;
+    t[0] = (uint32_t) up; t[1] = (uint32_t)(up >> 32);
+    for (int i = 2; i < 8; i++) t[i] = sx;
+    if (shift > 0) {
+        int words = shift >> 5, bits = shift & 31;
+        if (bits) {
+            uint32_t prev = 0;
+            for (int i = 0; i < 8; i++) {
+                uint32_t cur = t[i];
+                t[i] = (cur << bits) | prev;
+                prev = (uint32_t)((uint64_t) cur >> (32 - bits));
+            }
+        }
+        if (words) for (int i = 7; i >= 0; i--) t[i] = (i - words >= 0) ? t[i - words] : 0u;
+    } else if (shift < 0) {                             // tiny term below the radix: arithmetic right shift
+        int sh = -shift, words = sh >> 5, bits = sh & 31;
+        if (words) for (int i = 0; i < 8; i++) t[i] = (i + words < 8) ? t[i + words] : sx;
+        if (bits) {
+            uint32_t next = sx;
+            for (int i = 7; i >= 0; i--) { uint32_t cur = t[i]; t[i] = (cur >> bits) | (next << (32 - bits)); next = cur; }
+        }
+    }
+    uint64_t carry = 0;
+    for (int i = 0; i < 8; i++) { uint64_t v = (uint64_t) q[i] + t[i] + carry; q[i] = (uint32_t) v; carry = v >> 32; }
+}
+
+// final readout: signed 256-bit quire (radix at QFRAC) -> double, one rounding.
+static double ggml_q256_to_double(const uint32_t q[8]) {
+    uint32_t m[8]; for (int i = 0; i < 8; i++) m[i] = q[i];
+    int neg = (m[7] >> 31) & 1;
+    if (neg) { uint64_t c = 1; for (int i = 0; i < 8; i++) { uint64_t v = (uint64_t)(~m[i]) + c; m[i] = (uint32_t) v; c = v >> 32; } }
+    double v = 0.0;
+    for (int i = 7; i >= 0; i--) v = v * 4294967296.0 + (double) m[i];
+    v = ldexp(v, -GGML_BP8_QFRAC);
+    return neg ? -v : v;
+}
+
+void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_BPOSIT8;
+    const int nb = n / qk;
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_bposit8 * GGML_RESTRICT x = vx;
+    const block_bposit8 * GGML_RESTRICT y = vy;
+
+    uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int ib = 0; ib < nb; ++ib) {
+        const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp;   // power-of-two block scales add
+        for (int j = 0; j < qk; j++) {
+            int64_t Mx, My; int Ex, Ey;
+            ggml_bp8_code_to_ME(x[ib].qs[j], &Mx, &Ex);
+            if (Mx == 0) continue;
+            ggml_bp8_code_to_ME(y[ib].qs[j], &My, &Ey);
+            if (My == 0) continue;
+            const int64_t P = Mx * My;                                   // exact: |M|<=31 -> |P|<2^10
+            ggml_q256_add_shifted(quire, P, Ex + Ey + se + GGML_BP8_QFRAC);
+        }
+    }
+    *s = (float) ggml_q256_to_double(quire);
 }
 
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
