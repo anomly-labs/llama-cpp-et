@@ -567,6 +567,19 @@ static double ggml_q256_to_double(const uint32_t q[8]) {
     return neg ? -v : v;
 }
 
+// precomputed (M,E) lattice: identical values to ggml_bp8_code_to_ME, hoisted
+// out of the dot inner loop. Idempotent init (all threads fill the same values).
+static int64_t g_bp8_lut_M[256];
+static int     g_bp8_lut_E[256];
+static volatile int g_bp8_lut_ready = 0;
+static void ggml_bp8_lut_init(void) {
+    if (g_bp8_lut_ready) return;
+    for (int c = 0; c < 256; c++) {
+        ggml_bp8_code_to_ME((uint8_t) c, &g_bp8_lut_M[c], &g_bp8_lut_E[c]);
+    }
+    g_bp8_lut_ready = 1;
+}
+
 void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -576,6 +589,7 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    ggml_bp8_lut_init();
     const block_bposit8 * GGML_RESTRICT x = vx;
     const block_bposit8 * GGML_RESTRICT y = vy;
 
@@ -583,13 +597,12 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
     for (int ib = 0; ib < nb; ++ib) {
         const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp;   // power-of-two block scales add
         for (int j = 0; j < qk; j++) {
-            int64_t Mx, My; int Ex, Ey;
-            ggml_bp8_code_to_ME(x[ib].qs[j], &Mx, &Ex);
-            if (Mx == 0) continue;
-            ggml_bp8_code_to_ME(y[ib].qs[j], &My, &Ey);
+            const int64_t Mx = g_bp8_lut_M[x[ib].qs[j]];
+            if (Mx == 0) continue;                                       // zero / NaR
+            const int64_t My = g_bp8_lut_M[y[ib].qs[j]];
             if (My == 0) continue;
             const int64_t P = Mx * My;                                   // exact: |M|<=31 -> |P|<2^10
-            ggml_q256_add_shifted(quire, P, Ex + Ey + se + GGML_BP8_QFRAC);
+            ggml_q256_add_shifted(quire, P, g_bp8_lut_E[x[ib].qs[j]] + g_bp8_lut_E[y[ib].qs[j]] + se + GGML_BP8_QFRAC);
         }
     }
     *s = (float) ggml_q256_to_double(quire);
