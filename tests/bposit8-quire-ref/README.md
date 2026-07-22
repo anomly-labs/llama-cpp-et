@@ -14,3 +14,10 @@ computes the W8A8 dot in a bit-exact 256-bit / 96-frac Kulisch quire.
 - `../test-bposit8-quire.c` — links the built ggml libs and exercises the
   REGISTERED type-traits dispatch (from_float + vec_dot), cross-checked vs the
   dequantized double dot (8/8 trials, rel 0).
+
+- `bp8_reproducibility.c` — demonstrates the *reason* the format is
+  cross-hardware reproducible: the exact-quire dot is invariant to reduction
+  order (0/200 trials order-dependent) while float32 is not (184/200). Different
+  SIMD widths / lane counts reduce in different orders, so order-invariance is
+  what makes host == board bit-identity (`max_abs = 0`) possible.
+  Build: `cc -O2 bp8_reproducibility.c -lm && ./a.out`.
