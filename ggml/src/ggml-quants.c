@@ -580,8 +580,10 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 #define BP8_NAR    0x80
 
 // decode one bp8 code to its exact dyadic value (double). Zero/NaR -> 0.
-static double ggml_bp8_code_to_double(uint8_t p) {
-    if (p == BP8_ZERO || p == BP8_NAR) return 0.0;
+// out_absT (optional) receives |T| where T = 4*k+e (the useed+exp scale), used
+// only to distinguish the canonical bounded (|T|<=12) lattice from unbounded codes.
+static double ggml_bp8_code_to_double(uint8_t p, int * out_absT) {
+    if (p == BP8_ZERO || p == BP8_NAR) { if (out_absT) *out_absT = 0; return 0.0; }
     int s = (p >> 7) & 1;
     int rest = p & 0x7F;
     if (s) rest = ((~rest) + 1) & 0x7F;              // two's complement of trailing 7 bits
@@ -599,6 +601,7 @@ static double ggml_bp8_code_to_double(uint8_t p) {
         if (ew > 0) { e = (r2 >> (rem - ew)) & ((1 << ew) - 1); e <<= (BP8_ES - ew); }
         rem -= ew; fw = rem; fb = fw > 0 ? (r2 & ((1 << fw) - 1)) : 0;
     }
+    if (out_absT) { int T = 4 * k_reg + e; *out_absT = T < 0 ? -T : T; }
     double m = (double)((1 << fw) + fb);             // >= 1
     int    E = 4 * k_reg + e - fw;                    // useed=16=2^4 -> 4*k
     return (s ? -m : m) * ldexp(1.0, E);             // m * 2^E
@@ -606,10 +609,11 @@ static double ggml_bp8_code_to_double(uint8_t p) {
 
 // decoded value grid, built once (thread-safe enough: idempotent fill).
 static double g_bp8_val[256];
+static int    g_bp8_absT[256];                       // |T| = |4k+e| per code
 static int    g_bp8_ready = 0;
 static void ggml_bp8_init(void) {
     if (g_bp8_ready) return;
-    for (int c = 0; c < 256; c++) g_bp8_val[c] = ggml_bp8_code_to_double((uint8_t) c);
+    for (int c = 0; c < 256; c++) g_bp8_val[c] = ggml_bp8_code_to_double((uint8_t) c, &g_bp8_absT[c]);
     g_bp8_ready = 1;
 }
 
@@ -617,10 +621,17 @@ static void ggml_bp8_init(void) {
 static uint8_t ggml_bp8_encode_nearest(double x) {
     ggml_bp8_init();
     if (x == 0.0) return BP8_ZERO;
+    // EXPERIMENT (Anomly, uncommitted): ANOMLY_BP8_BOUNDED=1 restricts the target
+    // lattice to the canonical RS=3 BOUNDED range |T|<=12, so intra-block outliers
+    // saturate as a bounded b-posit8 codec would. Default = unbounded (open-bposit).
+    // Used only to measure the PPL cost of bounding; NOT a shipped code path.
+    static int bounded = -1;
+    if (bounded < 0) { const char * ev = getenv("ANOMLY_BP8_BOUNDED"); bounded = (ev && ev[0] == '1') ? 1 : 0; }
     uint8_t best = BP8_ZERO;
     double  bestd = INFINITY;
     for (int c = 0; c < 256; c++) {
         if (c == BP8_NAR) continue;                  // NaR is never a quantization target
+        if (bounded && g_bp8_absT[c] > 12) continue; // bounded mode: skip |T|>12 codes
         double d = fabs(g_bp8_val[c] - x);
         if (d < bestd) { bestd = d; best = (uint8_t) c; }
     }
