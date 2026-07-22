@@ -667,6 +667,14 @@ void dequantize_row_bposit8(const block_bposit8 * GGML_RESTRICT x, float * GGML_
     }
 }
 
+// multi-row driver for ggml_quantize_chunk (b-posit8 W8A8, Anomly). The ref
+// encoder is already exact + reproducible, so no imatrix is used.
+size_t quantize_bposit8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_bposit8_ref(src, (block_bposit8 *) dst, (int64_t) nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_BPOSIT8, n_per_row);
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -5751,6 +5759,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
 
+        case GGML_TYPE_BPOSIT8:
+            // b-posit8 W8A8 (Anomly): int8 exponent + byte codes; the encoder never
+            // emits NaR, and every code is a finite lattice value -> nothing to validate.
+            break;
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
