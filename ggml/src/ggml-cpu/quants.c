@@ -605,12 +605,7 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
     const block_bposit8 * GGML_RESTRICT y = vy;
 
     uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    int64_t bins[GGML_BP8_SHIFT_MAX];
-    uint8_t hit[GGML_BP8_SHIFT_MAX];
-    int touched[GGML_BP8_SHIFT_MAX];
-    int ntouched = 0;
-    memset(bins, 0, sizeof bins);
-    memset(hit, 0, sizeof hit);
+    int64_t bins[GGML_BP8_SHIFT_MAX] = { 0 };
     for (int ib = 0; ib < nb; ++ib) {
         const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp + GGML_BP8_QFRAC;
         const uint8_t * GGML_RESTRICT xq = x[ib].qs;
@@ -620,15 +615,25 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
             if (P == 0) continue;
             const int shift = g_bp8_lut_E[xq[j]] + g_bp8_lut_E[yq[j]] + se;
             if (shift >= 0 && shift < GGML_BP8_SHIFT_MAX) {
-                if (!hit[shift]) { hit[shift] = 1; touched[ntouched++] = shift; }
                 bins[shift] += P;
             } else {
                 ggml_q256_add_shifted(quire, P, shift);                 // sub-radix: per-term truncation
             }
         }
     }
-    for (int t = 0; t < ntouched; t++) {
-        ggml_q256_add_shifted(quire, bins[touched[t]], touched[t]);
+    // Flush the bins. OpenEvolve (workspace bp8_vecdot_speed, 2026-09-05) found that a plain
+    // scan of the 512 bins beats tracking touched bins (no hit[] bookkeeping in the hot loop);
+    // 1.42x over the tracked version, bit-identical under the same gate.
+    int i = 0;
+    while (i < GGML_BP8_SHIFT_MAX && bins[i] == 0) i++;
+    for (; i < GGML_BP8_SHIFT_MAX - 3; i += 4) {
+        if (bins[i]     != 0) ggml_q256_add_shifted(quire, bins[i],     i);
+        if (bins[i + 1] != 0) ggml_q256_add_shifted(quire, bins[i + 1], i + 1);
+        if (bins[i + 2] != 0) ggml_q256_add_shifted(quire, bins[i + 2], i + 2);
+        if (bins[i + 3] != 0) ggml_q256_add_shifted(quire, bins[i + 3], i + 3);
+    }
+    for (; i < GGML_BP8_SHIFT_MAX; i++) {
+        if (bins[i] != 0) ggml_q256_add_shifted(quire, bins[i], i);
     }
     *s = (float) ggml_q256_to_double(quire);
 }
