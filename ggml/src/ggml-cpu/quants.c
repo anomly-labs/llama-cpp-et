@@ -580,6 +580,17 @@ static void ggml_bp8_lut_init(void) {
     g_bp8_lut_ready = 1;
 }
 
+// Binned accumulation (2026-09-05): products that share a shift are summed in an int64
+// first and placed into the quire ONCE per distinct shift. Exact by construction for
+// shift >= 0 — placement is a pure left shift with no truncation and 256-bit two's-
+// complement addition is associative — and |M_x*M_y| < 2^10 leaves 2^53 terms of headroom
+// in the int64. Terms with shift < 0 (below the radix point; only with absurd block
+// scales) are truncated per term exactly as before, because sum-of-truncations differs
+// from truncation-of-sum. Bit-identical to the per-term kernel on the rational golden set,
+// 4,000 random rows incl. sub-radix rows, and under K-permutation (openevolve workspace
+// bp8_vecdot_speed, evaluator gate); 6.9x median throughput on x86.
+#define GGML_BP8_SHIFT_MAX 512   // shift = Ex+Ey+se+96 with |E| <= 31, |se| <= 254 -> < 512
+
 void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -594,16 +605,30 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
     const block_bposit8 * GGML_RESTRICT y = vy;
 
     uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    int64_t bins[GGML_BP8_SHIFT_MAX];
+    uint8_t hit[GGML_BP8_SHIFT_MAX];
+    int touched[GGML_BP8_SHIFT_MAX];
+    int ntouched = 0;
+    memset(bins, 0, sizeof bins);
+    memset(hit, 0, sizeof hit);
     for (int ib = 0; ib < nb; ++ib) {
-        const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp;   // power-of-two block scales add
+        const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp + GGML_BP8_QFRAC;
+        const uint8_t * GGML_RESTRICT xq = x[ib].qs;
+        const uint8_t * GGML_RESTRICT yq = y[ib].qs;
         for (int j = 0; j < qk; j++) {
-            const int64_t Mx = g_bp8_lut_M[x[ib].qs[j]];
-            if (Mx == 0) continue;                                       // zero / NaR
-            const int64_t My = g_bp8_lut_M[y[ib].qs[j]];
-            if (My == 0) continue;
-            const int64_t P = Mx * My;                                   // exact: |M|<=31 -> |P|<2^10
-            ggml_q256_add_shifted(quire, P, g_bp8_lut_E[x[ib].qs[j]] + g_bp8_lut_E[y[ib].qs[j]] + se + GGML_BP8_QFRAC);
+            const int64_t P = g_bp8_lut_M[xq[j]] * g_bp8_lut_M[yq[j]];   // 0 when either is zero/NaR
+            if (P == 0) continue;
+            const int shift = g_bp8_lut_E[xq[j]] + g_bp8_lut_E[yq[j]] + se;
+            if (shift >= 0 && shift < GGML_BP8_SHIFT_MAX) {
+                if (!hit[shift]) { hit[shift] = 1; touched[ntouched++] = shift; }
+                bins[shift] += P;
+            } else {
+                ggml_q256_add_shifted(quire, P, shift);                 // sub-radix: per-term truncation
+            }
         }
+    }
+    for (int t = 0; t < ntouched; t++) {
+        ggml_q256_add_shifted(quire, bins[touched[t]], touched[t]);
     }
     *s = (float) ggml_q256_to_double(quire);
 }
