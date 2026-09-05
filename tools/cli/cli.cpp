@@ -77,9 +77,27 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     }
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
                      || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm
-                     || (matmuls && strcmp(t->name, "inp_embd") == 0);   // layer-0 residual input
+                     || (matmuls && (strcmp(t->name, "inp_embd") == 0 || (strcmp(t->name, "embd") == 0 && t->op == GGML_OP_GET_ROWS)))   // layer-0 residual input
+                     || (matmuls && strcmp(t->name, "inp_tokens") == 0);
     if (ask) {
         return wanted;
+    }
+    if (matmuls && !ask && t->op == GGML_OP_GET_ROWS && (strcmp(t->name, "embd") == 0 || strcmp(t->name, "inp_embd") == 0)
+        && t->src[1] && t->src[1]->type == GGML_TYPE_I32) {
+        // the token ids of this evaluation (prefill: the prompt; decode: the sampled token) from the
+        // embedding lookup's index tensor (input leaves never reach the callback), so a reference
+        // re-executor can reproduce the whole sequence without llama.cpp's tokenizer
+        const int64_t nt = t->src[1]->ne[0];
+        std::vector<int32_t> ids((size_t) nt);
+        ggml_backend_tensor_get(t->src[1], ids.data(), 0, (size_t) nt * sizeof(int32_t));
+        FILE * f = fopen((const char *) user_data, "ab");
+        if (f) {
+            fprintf(f, "{\"tensor\":\"inp_tokens\",\"n\":%lld,\"ids\":[", (long long) nt);
+            for (int64_t i = 0; i < nt; i++) fprintf(f, "%s%d", i ? "," : "", ids[i]);
+            fputs("]}\n", f);
+            fclose(f);
+        }
+        // fall through: the embedding row itself is dumped below
     }
     if (!wanted || t->type != GGML_TYPE_F32) {
         return true;
