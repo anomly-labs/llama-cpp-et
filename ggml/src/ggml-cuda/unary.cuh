@@ -99,10 +99,7 @@ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
 }
 
 __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {
-    const float GELU_COEF_A    = 0.044715f;
-    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
-
-    return 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+    return det_geluf(x);   // Anomly exact profile: deterministic tanh-GELU, identical to the CPU backend
 }
 
 __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {
