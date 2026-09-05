@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bruscoe.
+# no-sudo relocated Ubuntu cross toolchain (see ~/development/cross/aarch64), static binaries for qemu-aarch64 / the Ultra96
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(R "/home/nrydev_server1/development/cross/aarch64/root")
+set(CMAKE_C_COMPILER   ${R}/usr/bin/aarch64-linux-gnu-gcc-13)
+set(CMAKE_CXX_COMPILER ${R}/usr/bin/aarch64-linux-gnu-g++-13)
+set(CMAKE_AR     ${R}/usr/bin/aarch64-linux-gnu-ar)
+set(CMAKE_RANLIB ${R}/usr/bin/aarch64-linux-gnu-ranlib)
+set(CMAKE_SYSROOT ${R})
+set(XFLAGS "-B${R}/usr/lib/gcc-cross/aarch64-linux-gnu/13/ -B${R}/usr/bin/ --sysroot=${R}")
+set(CMAKE_C_FLAGS_INIT   "${XFLAGS}")
+set(CMAKE_CXX_FLAGS_INIT "${XFLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "${XFLAGS} -static")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

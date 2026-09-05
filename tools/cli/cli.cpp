@@ -93,7 +93,15 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     } else {
         snprintf(tname, sizeof(tname), "%s", t->name);
     }
-    fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"hex\":\"", tname, (long long) n, (long long) row);
+    if (t->op == GGML_OP_ROPE && t->src[1] && t->src[1]->type == GGML_TYPE_I32) {
+        // the position of the dumped row (src[1] = positions), so a verifier can re-execute RoPE
+        int32_t pos = -1;
+        const int64_t prow = row < t->src[1]->ne[0] ? row : t->src[1]->ne[0] - 1;
+        ggml_backend_tensor_get(t->src[1], &pos, (size_t) prow * sizeof(int32_t), sizeof(int32_t));
+        fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"pos\":%d,\"hex\":\"", tname, (long long) n, (long long) row, pos);
+    } else {
+        fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"hex\":\"", tname, (long long) n, (long long) row);
+    }
     const unsigned char * b = (const unsigned char *) buf.data();
     for (size_t i = 0; i < (size_t) n * sizeof(float); i++) {
         fputc("0123456789abcdef"[b[i] >> 4], f);
