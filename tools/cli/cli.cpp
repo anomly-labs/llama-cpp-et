@@ -3,6 +3,12 @@
 #include "log.h"
 
 #include "cli-context.h"
+#include "ggml-backend.h"
+
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <vector>
 
 #include <signal.h>
 
@@ -28,6 +34,42 @@ static void signal_handler(int) {
 #endif
 
 // satisfies -Wmissing-declarations
+// ---------------------------------------------------------------------------
+// Anomly INVAR client-side spot-check (CSC) hook. INVAR_LOGITS_OUT=<file> appends, for
+// every graph evaluation, the LAST ROW of the final-norm hidden state ("result_norm",
+// what the lm_head matmul consumes) and of the logits ("result_output") as JSON lines:
+//   {"tensor":"result_norm","n":576,"row":0,"hex":"<f32 little-endian hex>"}
+// A verifier holding the GGUF re-quantises the hidden row exactly as ggml does and
+// re-executes sampled lm_head rows in the exact quire; under the b-posit8 profile the
+// re-executed logits must match these bit for bit (tests/csc/csc_verify.py).
+// Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bruscoe.
+static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0;
+    if (ask) {
+        return wanted;
+    }
+    if (!wanted || t->type != GGML_TYPE_F32) {
+        return true;
+    }
+    const int64_t n = t->ne[0];
+    const int64_t row = t->ne[1] - 1;                   // last position = the sampled token
+    std::vector<float> buf((size_t) n);
+    ggml_backend_tensor_get(t, buf.data(), (size_t) row * t->nb[1], (size_t) n * sizeof(float));
+    FILE * f = fopen((const char *) user_data, "ab");
+    if (!f) {
+        return true;
+    }
+    fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"hex\":\"", t->name, (long long) n, (long long) row);
+    const unsigned char * b = (const unsigned char *) buf.data();
+    for (size_t i = 0; i < (size_t) n * sizeof(float); i++) {
+        fputc("0123456789abcdef"[b[i] >> 4], f);
+        fputc("0123456789abcdef"[b[i] & 15], f);
+    }
+    fputs("\"}\n", f);
+    fclose(f);
+    return true;
+}
+
 int llama_cli(int argc, char ** argv);
 
 int llama_cli(int argc, char ** argv) {
@@ -39,6 +81,10 @@ int llama_cli(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
+    }
+    if (const char * logits_out = getenv("INVAR_LOGITS_OUT")) {
+        params.cb_eval           = invar_logits_cb;
+        params.cb_eval_user_data = (void *) logits_out;
     }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
