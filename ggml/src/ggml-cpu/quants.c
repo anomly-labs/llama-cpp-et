@@ -619,9 +619,12 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
                 if (sh_ >= 0 && sh_ < GGML_BP8_SHIFT_MAX) bins[sh_] += P_; \
                 else ggml_q256_add_shifted(quire, P_, sh_); \
             } } while (0)
-        for (int j = 0; j < qk; j += 8) {
-            GGML_BP8_LANE(0); GGML_BP8_LANE(1); GGML_BP8_LANE(2); GGML_BP8_LANE(3);
-            GGML_BP8_LANE(4); GGML_BP8_LANE(5); GGML_BP8_LANE(6); GGML_BP8_LANE(7);
+        // 16-way (OpenEvolve round 4b, +6-8% at the kernel under the bit-exact gate)
+        for (int j = 0; j < qk; j += 16) {
+            GGML_BP8_LANE(0);  GGML_BP8_LANE(1);  GGML_BP8_LANE(2);  GGML_BP8_LANE(3);
+            GGML_BP8_LANE(4);  GGML_BP8_LANE(5);  GGML_BP8_LANE(6);  GGML_BP8_LANE(7);
+            GGML_BP8_LANE(8);  GGML_BP8_LANE(9);  GGML_BP8_LANE(10); GGML_BP8_LANE(11);
+            GGML_BP8_LANE(12); GGML_BP8_LANE(13); GGML_BP8_LANE(14); GGML_BP8_LANE(15);
         }
 #undef GGML_BP8_LANE
     }
@@ -629,12 +632,19 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
     // scan of the 512 bins beats tracking touched bins (no hit[] bookkeeping in the hot loop);
     // 1.42x over the tracked version, bit-identical under the same gate.
     int i = 0;
-    while (i < GGML_BP8_SHIFT_MAX && bins[i] == 0) i++;
-    for (; i < GGML_BP8_SHIFT_MAX - 3; i += 4) {
+    while (i < GGML_BP8_SHIFT_MAX - 7) {                 // skip leading zero bins 8 at a time (round 4b)
+        if (bins[i] | bins[i+1] | bins[i+2] | bins[i+3] | bins[i+4] | bins[i+5] | bins[i+6] | bins[i+7]) break;
+        i += 8;
+    }
+    for (; i < GGML_BP8_SHIFT_MAX - 7; i += 8) {
         if (bins[i]     != 0) ggml_q256_add_shifted(quire, bins[i],     i);
         if (bins[i + 1] != 0) ggml_q256_add_shifted(quire, bins[i + 1], i + 1);
         if (bins[i + 2] != 0) ggml_q256_add_shifted(quire, bins[i + 2], i + 2);
         if (bins[i + 3] != 0) ggml_q256_add_shifted(quire, bins[i + 3], i + 3);
+        if (bins[i + 4] != 0) ggml_q256_add_shifted(quire, bins[i + 4], i + 4);
+        if (bins[i + 5] != 0) ggml_q256_add_shifted(quire, bins[i + 5], i + 5);
+        if (bins[i + 6] != 0) ggml_q256_add_shifted(quire, bins[i + 6], i + 6);
+        if (bins[i + 7] != 0) ggml_q256_add_shifted(quire, bins[i + 7], i + 7);
     }
     for (; i < GGML_BP8_SHIFT_MAX; i++) {
         if (bins[i] != 0) ggml_q256_add_shifted(quire, bins[i], i);
