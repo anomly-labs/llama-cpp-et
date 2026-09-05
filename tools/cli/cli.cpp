@@ -70,6 +70,11 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
             (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
             is_mm = true;   // post-RoPE rows are tagged Qcur_rope-<il>, post-bias rows Qcur_bias-<il>
         }
+        // the attention output projection may be unnamed (gemma3): it is the matmul fed by kqv_out-<il>
+        if (!is_mm && t->op == GGML_OP_MUL_MAT && t->src[1] && strncmp(t->src[1]->name, "kqv_out-", 8) == 0
+            && strncmp(t->name, "attn_out-", 9) != 0) {
+            is_mm = true;
+        }
     }
     static int names = -1;   // INVAR_LOGITS_NAMES=1: list every graph tensor (name, op, dims) once on stderr
     if (names < 0) { const char * ev = getenv("INVAR_LOGITS_NAMES"); names = (ev && ev[0] == '1') ? 1 : 0; }
@@ -134,6 +139,8 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         snprintf(tname, sizeof(tname), "%.4s_rope-%s", t->name, t->name + 5); // Qcur_rope-<il>
     } else if (t->op == GGML_OP_ADD && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0 || strncmp(t->name, "Vcur-", 5) == 0)) {
         snprintf(tname, sizeof(tname), "%.4s_bias-%s", t->name, t->name + 5); // Qcur_bias-<il> (projection bias added)
+    } else if (t->op == GGML_OP_MUL_MAT && t->src[1] && strncmp(t->src[1]->name, "kqv_out-", 8) == 0 && strncmp(t->name, "attn_out-", 9) != 0) {
+        snprintf(tname, sizeof(tname), "attn_out-%s", t->src[1]->name + 8);    // unnamed wo product (gemma3)
     } else {
         snprintf(tname, sizeof(tname), "%s", t->name);
     }
