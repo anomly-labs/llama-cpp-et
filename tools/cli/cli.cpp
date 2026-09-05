@@ -62,6 +62,12 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         for (int i = 0; mm[i]; i++) {
             if (strncmp(t->name, mm[i], strlen(mm[i])) == 0) { is_mm = true; break; }
         }
+        // Qcur/Kcur are re-emitted under the same name after RoPE; only the MUL_MAT output
+        // is the exact unit. Tag those "Qcur_mm-<il>" / "Kcur_mm-<il>" in the dump.
+        if (!is_mm && t->op == GGML_OP_MUL_MAT &&
+            (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
+            is_mm = true;
+        }
     }
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
                      || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm;
@@ -79,7 +85,13 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     if (!f) {
         return true;
     }
-    fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"hex\":\"", t->name, (long long) n, (long long) row);
+    char tname[GGML_MAX_NAME + 8];
+    if (t->op == GGML_OP_MUL_MAT && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
+        snprintf(tname, sizeof(tname), "%.4s_mm-%s", t->name, t->name + 5);   // Qcur_mm-<il>
+    } else {
+        snprintf(tname, sizeof(tname), "%s", t->name);
+    }
+    fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"hex\":\"", tname, (long long) n, (long long) row);
     const unsigned char * b = (const unsigned char *) buf.data();
     for (size_t i = 0; i < (size_t) n * sizeof(float); i++) {
         fputc("0123456789abcdef"[b[i] >> 4], f);
