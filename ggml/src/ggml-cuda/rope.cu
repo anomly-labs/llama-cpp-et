@@ -101,9 +101,13 @@ static __global__ void rope_norm(const T *            x,
 
     float cos_theta;
     float sin_theta;
-    if (!has_ff && ext_factor == 0.0f) {
+    if (ext_factor == 0.0f) {
         // Anomly exact profile: deterministic frequencies and trig (ggml-det), identical to the CPU cache
-        det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        if (has_ff) {
+            det_rope_sincos_ff((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, freq_factors[i0/2], &sin_theta, &cos_theta);
+        } else {
+            det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        }
         cos_theta = __fmul_rn(cos_theta, attn_factor);
         sin_theta = __fmul_rn(sin_theta, attn_factor);
         if (!forward) sin_theta = -sin_theta;
@@ -175,9 +179,13 @@ static __global__ void rope_neox(const T *            x,
 
     float cos_theta;
     float sin_theta;
-    if (!has_ff && ext_factor == 0.0f) {
+    if (ext_factor == 0.0f) {
         // Anomly exact profile: deterministic frequencies and trig (ggml-det), identical to the CPU cache
-        det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        if (has_ff) {
+            det_rope_sincos_ff((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, freq_factors[i0/2], &sin_theta, &cos_theta);
+        } else {
+            det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        }
         cos_theta = __fmul_rn(cos_theta, attn_factor);
         sin_theta = __fmul_rn(sin_theta, attn_factor);
         if (!forward) sin_theta = -sin_theta;

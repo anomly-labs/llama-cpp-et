@@ -5772,12 +5772,16 @@ static void rope_yarn(
 static void ggml_rope_cache_init(
      float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
      float * cache, float sin_sign, float theta_scale, float freq_base = 0.0f, int n_dims = 0) {
-    // Anomly exact profile: without YaRN / frequency factors the table is deterministic
+    // Anomly exact profile: without YaRN the table is deterministic (frequency factors included)
     // (ggml-det: exact frequencies, double reduction, fixed rounding) — identical to CUDA.
-    if (ext_factor == 0.0f && freq_factors == NULL && n_dims > 0) {
+    if (ext_factor == 0.0f && n_dims > 0) {
         for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
             float s, c;
-            ggml_det_rope_sincos(theta_base, (int) (i0 / 2), n_dims, freq_base, freq_scale, &s, &c);
+            if (freq_factors) {
+                ggml_det_rope_sincos_ff(theta_base, (int) (i0 / 2), n_dims, freq_base, freq_scale, freq_factors[i0/2], &s, &c);
+            } else {
+                ggml_det_rope_sincos(theta_base, (int) (i0 / 2), n_dims, freq_base, freq_scale, &s, &c);
+            }
             cache[i0 + 0] = c * mscale;
             cache[i0 + 1] = s * mscale * sin_sign;
         }

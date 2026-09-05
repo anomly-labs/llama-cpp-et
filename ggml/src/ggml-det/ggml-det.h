@@ -248,6 +248,15 @@ DET_FN void det_rope_sincos(float pos, int i, int n_dims, float freq_base, float
     *c = DET_D2F(cd);
 }
 
+// RoPE with a per-pair frequency factor (Llama 3 rope_freqs): theta = ((pos * freq_i) / ff) * freq_scale
+DET_FN void det_rope_sincos_ff(float pos, int i, int n_dims, float freq_base, float freq_scale, float ff, float * s, float * c) {
+    const double theta = DET_DMUL(DET_DDIV(DET_DMUL((double) pos, det_rope_freq(i, n_dims, freq_base)), (double) ff), (double) freq_scale);
+    double sd, cd;
+    det_sincos_d(theta, &sd, &cd);
+    *s = DET_D2F(sd);
+    *c = DET_D2F(cd);
+}
+
 // SiLU and sigmoid with a fixed formula: x * (1 / (1 + exp(-x)))
 DET_FN float det_sigmoidf(float x) { return DET_FDIV(1.0f, DET_FADD(1.0f, det_expf(-x))); }
 DET_FN float det_siluf(float x)    { return DET_FMUL(x, det_sigmoidf(x)); }
