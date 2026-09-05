@@ -104,21 +104,41 @@ def encode_nearest(x: float) -> int:
     return best
 
 
+def scale_exp_exact(blk) -> int:
+    """ggml_bp8_scale_exp_exact: round_half_even(log2(sqrt(S/32))) from the EXACT sum of
+    squares S (rational); tie = S a power of two; non-finite -> 0; all-zero -> 0."""
+    from fractions import Fraction
+    S = Fraction(0)
+    any_nz = False
+    for v in blk:
+        if v == 0.0:
+            continue
+        if not math.isfinite(v):
+            return 0
+        any_nz = True
+        f = Fraction(v)
+        S += f * f
+    if not any_nz:
+        return 0
+    N, D = S.numerator, S.denominator
+    E = (N.bit_length() - 1) - (D.bit_length() - 1) - 5
+    tie = (N & (N - 1)) == 0
+    if E % 2 == 0:
+        se = E // 2
+    else:
+        n = (E - 1) // 2
+        se = (n if n % 2 == 0 else n + 1) if tie else n + 1
+    return max(-128, min(127, se))
+
+
 def quantize_row(x: np.ndarray) -> list[tuple[int, list[int]]]:
-    """quantize_row_bposit8_ref in Python: [(scale_exp, codes[32]) ...]. Double math
-    throughout, same libm calls (sqrt, log2, lrint == round-half-even)."""
+    """quantize_row_bposit8_ref in Python: [(scale_exp, codes[32]) ...]. Exact integer
+    block-scale rule (scale_exp_exact), double math for the encode."""
     assert x.shape[0] % QK == 0
     out = []
     for i in range(x.shape[0] // QK):
         blk = x[i * QK:(i + 1) * QK].astype(np.float64)
-        sumsq = 0.0
-        for v in blk.tolist():
-            sumsq += v * v
-        rms = math.sqrt(sumsq / QK)
-        se = 0
-        if rms > 0.0:
-            se = int(round(math.log2(rms)))      # Python round == lrint (half-even)
-            se = max(-128, min(127, se))
+        se = scale_exp_exact(blk.tolist())
         inv = math.ldexp(1.0, -se)
         codes = [encode_nearest(v * inv) for v in blk.tolist()]
         out.append((se, codes))

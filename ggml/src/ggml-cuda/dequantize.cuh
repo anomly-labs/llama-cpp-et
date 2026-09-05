@@ -97,3 +97,12 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+// b-posit8 (Anomly): value = code_value * 2^scale_exp, one rounding to float (mirrors dequantize_row_bposit8)
+#include "bposit8-common.cuh"
+static __device__ __forceinline__ void dequantize_bposit8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_bposit8 * x = (const block_bposit8 *) vx;
+    const double sc = ldexp(1.0, (int) x[ib].scale_exp);
+    v.x = __double2float_rn(__dmul_rn(bp8_code_to_double(x[ib].qs[iqs + 0]), sc));
+    v.y = __double2float_rn(__dmul_rn(bp8_code_to_double(x[ib].qs[iqs + 1]), sc));
+}

@@ -678,31 +678,70 @@ static uint8_t ggml_bp8_encode_nearest(double x) {
     return g_bp8_sc[best_k];
 }
 
+// Exact block scale (2026-09-05): se = round_half_even(log2(sqrt(S/32))) where S is the EXACT
+// sum of squares of the block, held as a 640-bit integer with the radix point at bit 352
+// (float32 squares span 2^-298 .. 2^254 and are exact in double: 24x24 bits fit in 53).
+// floor(log2(S/32)) is the top set bit; a tie (log2 exactly n+1/2) is S a power of two.
+// No libm, no FMA contraction, no summation order: identical on CPU, CUDA, Python and Go.
+// Non-finite input -> se = 0 (the old lrint(log2(NaN)) was undefined).
+#define BP8_SS_LIMBS 20
+#define BP8_SS_RADIX 352
+static int ggml_bp8_scale_exp_exact(const float * GGML_RESTRICT x, int * any_nonzero) {
+    uint32_t acc[BP8_SS_LIMBS] = { 0 };
+    int any = 0;
+    for (int j = 0; j < QK_BPOSIT8; j++) {
+        const double v = (double) x[j];
+        if (v == 0.0) continue;
+        if (!isfinite(v)) { *any_nonzero = 1; return 0; }
+        any = 1;
+        const double p = v * v;                                   // exact
+        uint64_t bits; memcpy(&bits, &p, sizeof(bits));
+        const uint64_t mi = (bits & 0xFFFFFFFFFFFFFull) | (1ull << 52);
+        const int e2 = (int) ((bits >> 52) & 0x7FF) - 1023;      // p = mi * 2^(e2-52), p is normal
+        const int pos = e2 - 52 + BP8_SS_RADIX;
+        const int w = pos >> 5, b = pos & 31;
+        const uint64_t lo = b ? (mi << b) : mi;
+        const uint64_t hi = b ? (mi >> (64 - b)) : 0ull;
+        const uint32_t parts[3] = { (uint32_t) lo, (uint32_t) (lo >> 32), (uint32_t) hi };
+        uint64_t c = 0;
+        for (int i = 0; i < 3; i++) { const uint64_t t = (uint64_t) acc[w + i] + parts[i] + c; acc[w + i] = (uint32_t) t; c = t >> 32; }
+        for (int i = w + 3; c && i < BP8_SS_LIMBS; i++) { const uint64_t t = (uint64_t) acc[i] + c; acc[i] = (uint32_t) t; c = t >> 32; }
+    }
+    *any_nonzero = any;
+    if (!any) return 0;
+    int top = -1, pop = 0;
+    for (int i = BP8_SS_LIMBS - 1; i >= 0; i--) {
+        if (acc[i]) {
+            if (top < 0) { int t = 31; while (!((acc[i] >> t) & 1u)) t--; top = 32 * i + t; }
+            uint32_t m = acc[i]; while (m) { pop += (int) (m & 1u); m >>= 1; }
+        }
+    }
+    const int E = top - BP8_SS_RADIX - 5;                         // floor(log2(S/32))
+    int se;
+    if ((E & 1) == 0) {
+        se = E / 2;
+    } else {
+        const int n = (E - 1) / 2;
+        se = (pop == 1) ? (((n & 1) == 0) ? n : n + 1) : n + 1;   // exact tie -> half-even
+    }
+    if (se >  127) se =  127;
+    if (se < -128) se = -128;
+    return se;
+}
+
 void quantize_row_bposit8_ref(const float * GGML_RESTRICT x, block_bposit8 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_BPOSIT8 == 0);
     const int nb = k / QK_BPOSIT8;
     ggml_bp8_init();
     for (int i = 0; i < nb; i++) {
-        // power-of-two block scale: center the block on b-posit's dense ~1.0 band via RMS,
+        // power-of-two block scale: center the block on b-posit's dense ~1.0 band via the RMS,
         // rounded to an integer exponent (exact bit-shift -> reproducible on any hardware).
-        double sumsq = 0.0;
         int has_nonzero = 0;
-        for (int j = 0; j < QK_BPOSIT8; j++) {
-            const double v = (double) x[i*QK_BPOSIT8 + j];
-            sumsq += v * v;
-            if (v != 0.0) has_nonzero = 1;
-        }
+        const int se = ggml_bp8_scale_exp_exact(x + i*QK_BPOSIT8, &has_nonzero);
         if (!has_nonzero) {                          // all-zero block: se = 0, all codes 0 (same as below)
             y[i].scale_exp = 0;
             memset(y[i].qs, BP8_ZERO, QK_BPOSIT8);
             continue;
-        }
-        const double rms = sqrt(sumsq / QK_BPOSIT8);
-        int se = 0;
-        if (rms > 0.0) {
-            se = (int) lrint(log2(rms));
-            if (se >  127) se =  127;
-            if (se < -128) se = -128;
         }
         y[i].scale_exp = (int8_t) se;
         const double inv = ldexp(1.0, -se);          // 2^-se

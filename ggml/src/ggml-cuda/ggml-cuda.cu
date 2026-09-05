@@ -10,6 +10,7 @@
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
+#include "ggml-cuda/bposit8.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
@@ -1704,6 +1705,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (src0->type == GGML_TYPE_BPOSIT8) {
+        return false; // exact-quire path is never fused into mmvq
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1733,6 +1738,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_BPOSIT8) {
+        // exact b-posit8 W8A8 (Anomly): bit-identical to the CPU quire kernel; never cuBLAS
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        ggml_cuda_mul_mat_bposit8(ctx, src0, src1, dst);
         return;
     }
 
@@ -4648,6 +4660,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
+                if (a->type == GGML_TYPE_BPOSIT8) {
+                    return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -4708,6 +4723,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_BPOSIT8:
                         return true;
                     default:
                         return false;
