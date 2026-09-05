@@ -194,7 +194,9 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_CXX_FLAGS "")
 
-    set(CUDA_FLAGS -use_fast_math -extended-lambda)
+    # Anomly exact profile: IEEE semantics everywhere (no fast-math, no FMA contraction) so
+    # device float ops are the same operations the contraction-free CPU backend performs.
+    set(CUDA_FLAGS -fmad=false -extended-lambda)
 
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)

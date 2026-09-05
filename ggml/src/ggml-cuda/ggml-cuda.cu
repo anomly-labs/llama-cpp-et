@@ -1674,6 +1674,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+    if (tensor->src[0]->type == GGML_TYPE_F16) {
+        return false; // exact f16 path is never fused
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1745,6 +1748,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // exact b-posit8 W8A8 (Anomly): bit-identical to the CPU quire kernel; never cuBLAS
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
         ggml_cuda_mul_mat_bposit8(ctx, src0, src1, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src0->nb[0] == sizeof(ggml_fp16_t) && src1->nb[0] == sizeof(float)) {
+        // Anomly exact profile: f16 matmuls (attention KQ / KQV) accumulate exactly, like the CPU
+        ggml_cuda_mul_mat_f16_exact(ctx, src0, src1, dst);
         return;
     }
 
@@ -4982,7 +4991,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            return false; // Anomly exact profile: attention runs as exact KQ / deterministic softmax / exact KQV
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

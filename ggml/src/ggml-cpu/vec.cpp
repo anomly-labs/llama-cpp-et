@@ -1,4 +1,5 @@
 #include "vec.h"
+#include "ggml-det-api.h"
 
 #include <cassert>
 
@@ -262,194 +263,22 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 }
 
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {
+    // Anomly exact profile: exact 256-bit quire dot (ggml-det), one rounding, any order;
+    // bit-identical to the CUDA exact f16 kernel. Replaces the SIMD/FMA float accumulation.
     assert(nrc == 1);
     GGML_UNUSED(nrc);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
-
-    ggml_float sumf = 0.0;
-
-
-#if defined(GGML_SIMD)
-    #if defined(__ARM_FEATURE_SVE)
-        const int ggml_f16_epr = svcnth();
-        const int ggml_f16_step = 8 * ggml_f16_epr;
-        const int np = n - (n % ggml_f16_step);
-        const int np2 = n - (n % ggml_f16_epr);
-
-        svfloat32_t sum1_lo = svdup_n_f32(0.0f);
-        svfloat32_t sum1_hi = svdup_n_f32(0.0f);
-        svfloat32_t sum2_lo = svdup_n_f32(0.0f);
-        svfloat32_t sum2_hi = svdup_n_f32(0.0f);
-        svfloat32_t sum3_lo = svdup_n_f32(0.0f);
-        svfloat32_t sum3_hi = svdup_n_f32(0.0f);
-        svfloat32_t sum4_lo = svdup_n_f32(0.0f);
-        svfloat32_t sum4_hi = svdup_n_f32(0.0f);
-
-        for (int i = 0; i < np; i += ggml_f16_step) {
-            ggml_sve_f16_fma_widened(&sum1_lo, &sum1_hi, GGML_F16x_VEC_LOAD(x + i + 0 * ggml_f16_epr, 0), GGML_F16x_VEC_LOAD(y + i + 0 * ggml_f16_epr, 0));
-            ggml_sve_f16_fma_widened(&sum2_lo, &sum2_hi, GGML_F16x_VEC_LOAD(x + i + 1 * ggml_f16_epr, 1), GGML_F16x_VEC_LOAD(y + i + 1 * ggml_f16_epr, 1));
-            ggml_sve_f16_fma_widened(&sum3_lo, &sum3_hi, GGML_F16x_VEC_LOAD(x + i + 2 * ggml_f16_epr, 2), GGML_F16x_VEC_LOAD(y + i + 2 * ggml_f16_epr, 2));
-            ggml_sve_f16_fma_widened(&sum4_lo, &sum4_hi, GGML_F16x_VEC_LOAD(x + i + 3 * ggml_f16_epr, 3), GGML_F16x_VEC_LOAD(y + i + 3 * ggml_f16_epr, 3));
-            ggml_sve_f16_fma_widened(&sum1_lo, &sum1_hi, GGML_F16x_VEC_LOAD(x + i + 4 * ggml_f16_epr, 4), GGML_F16x_VEC_LOAD(y + i + 4 * ggml_f16_epr, 4));
-            ggml_sve_f16_fma_widened(&sum2_lo, &sum2_hi, GGML_F16x_VEC_LOAD(x + i + 5 * ggml_f16_epr, 5), GGML_F16x_VEC_LOAD(y + i + 5 * ggml_f16_epr, 5));
-            ggml_sve_f16_fma_widened(&sum3_lo, &sum3_hi, GGML_F16x_VEC_LOAD(x + i + 6 * ggml_f16_epr, 6), GGML_F16x_VEC_LOAD(y + i + 6 * ggml_f16_epr, 6));
-            ggml_sve_f16_fma_widened(&sum4_lo, &sum4_hi, GGML_F16x_VEC_LOAD(x + i + 7 * ggml_f16_epr, 7), GGML_F16x_VEC_LOAD(y + i + 7 * ggml_f16_epr, 7));
-        }
-
-        for (int i = np; i < np2; i += ggml_f16_epr) {
-            ggml_sve_f16_fma_widened(&sum1_lo, &sum1_hi, GGML_F16x_VEC_LOAD(x + i, 0), GGML_F16x_VEC_LOAD(y + i, 0));
-        }
-
-        if (np2 < n) {
-            const svbool_t pg = svwhilelt_b16(np2, n);
-            const svfloat16_t rx = svld1_f16(pg, (const __fp16 *)(x + np2));
-            const svfloat16_t ry = svld1_f16(pg, (const __fp16 *)(y + np2));
-
-            ggml_sve_f16_fma_widened(&sum1_lo, &sum1_hi, rx, ry);
-        }
-
-        sum1_lo = svadd_f32_m(DEFAULT_PG32, sum1_lo, sum2_lo);
-        sum1_hi = svadd_f32_m(DEFAULT_PG32, sum1_hi, sum2_hi);
-        sum3_lo = svadd_f32_m(DEFAULT_PG32, sum3_lo, sum4_lo);
-        sum3_hi = svadd_f32_m(DEFAULT_PG32, sum3_hi, sum4_hi);
-        sum1_lo = svadd_f32_m(DEFAULT_PG32, sum1_lo, sum3_lo);
-        sum1_hi = svadd_f32_m(DEFAULT_PG32, sum1_hi, sum3_hi);
-
-        sumf = ggml_sve_sum_f32x2(sum1_lo, sum1_hi);
-    #elif defined(__riscv_v_intrinsic)
-        #if defined(__riscv_zvfh)
-            int vl = __riscv_vsetvlmax_e32m2();
-            vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-            vfloat32m2_t vsum;
-            vfloat16m1_t ax;
-            vfloat16m1_t ay;
-            vsum = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vmv_v_x_u32m2(0, vl));
-            for (int i = 0; i < n; i += vl) {
-                vl = __riscv_vsetvl_e16m1(n - i);
-                ax = __riscv_vle16_v_f16m1_tu(ax, (const _Float16 *)&x[i], vl);
-                ay = __riscv_vle16_v_f16m1_tu(ay, (const _Float16 *)&y[i], vl);
-                vsum = __riscv_vfwmacc_vv_f32m2_tu(vsum, ax, ay, vl);
-            }
-            vl = __riscv_vsetvlmax_e32m1();
-            vfloat32m1_t ac0 = __riscv_vfadd_vv_f32m1(__riscv_vget_v_f32m2_f32m1(vsum, 0), __riscv_vget_v_f32m2_f32m1(vsum, 1), vl);
-            vs = __riscv_vfredusum_vs_f32m1_f32m1(ac0, vs, vl);
-            sumf += __riscv_vfmv_f_s_f32m1_f32(vs);
-        #else
-            for (int i = 0; i < n; ++i) {
-                sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
-            }
-        #endif // __riscv_zvfh
-    #else
-        const int np = (n & ~(GGML_F16_STEP - 1));
-
-        GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
-
-        GGML_F16_VEC ax[GGML_F16_ARR];
-        GGML_F16_VEC ay[GGML_F16_ARR];
-
-        for (int i = 0; i < np; i += GGML_F16_STEP) {
-            for (int j = 0; j < GGML_F16_ARR; j++) {
-                ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
-                ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
-
-                sum[j] = GGML_F16_VEC_FMA(sum[j], ax[j], ay[j]);
-            }
-        }
-
-        // reduce sum0..sum3 to sum0
-        GGML_F16_VEC_REDUCE(sumf, sum);
-
-        // leftovers
-        for (int i = np; i < n; ++i) {
-            sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
-        }
-        // if you hit this, you are likely running outside the FP range
-        assert(!isnan(sumf) && !isinf(sumf));
-    #endif
-#else
-    for (int i = 0; i < n; ++i) {
-        sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
-    }
-#endif // GGML_SIMD
-
-    *s = sumf;
+    *s = ggml_det_dot_f16((const uint16_t *) x, (const uint16_t *) y, n);
 }
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
-    int i = 0;
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-    for (; i + 15 < n; i += 16) {
-        _mm512_storeu_ps(y + i, ggml_v_silu(_mm512_loadu_ps(x + i)));
-    }
-#elif defined(__AVX2__) && defined(__FMA__)
-    for (; i + 7 < n; i += 8) {
-        _mm256_storeu_ps(y + i, ggml_v_silu(_mm256_loadu_ps(x + i)));
-    }
-#elif defined(__SSE2__)
-    for (; i + 3 < n; i += 4) {
-        _mm_storeu_ps(y + i, ggml_v_silu(_mm_loadu_ps(x + i)));
-    }
-#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
-    const int vlen = svcntw();
-    for (; i < n; i += vlen) {
-        const svbool_t pg = svwhilelt_b32_s32(i, n);
-        svst1_f32(pg, y + i, ggml_v_silu(pg, svld1_f32(pg, x + i)));
-    }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-    for (; i + 3 < n; i += 4) {
-        vst1q_f32(y + i, ggml_v_silu(vld1q_f32(x + i)));
-    }
-#elif defined(__riscv_v_intrinsic)
-    for (int vl; i < n; i += vl) {
-        vl = __riscv_vsetvl_e32m2(n - i);
-        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
-        vfloat32m2_t vy = ggml_v_silu_m2(vx, vl);
-        __riscv_vse32_v_f32m2(&y[i], vy, vl);
-    }
-#endif
-    for (; i < n; ++i) {
-        y[i] = ggml_silu_f32(x[i]);
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_siluf(x[i]);   // Anomly exact profile: deterministic
 }
 
 void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g) {
-    int i = 0;
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-    for (; i + 15 < n; i += 16) {
-        _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_silu(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
-    }
-#elif defined(__AVX2__) && defined(__FMA__)
-    for (; i + 7 < n; i += 8) {
-        _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_silu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
-    }
-#elif defined(__SSE2__)
-    for (; i + 3 < n; i += 4) {
-        _mm_storeu_ps(y + i, _mm_mul_ps(ggml_v_silu(_mm_loadu_ps(x + i)), _mm_loadu_ps(g + i)));
-    }
-#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
-    const int vlen = svcntw();
-    for (; i < n; i += vlen) {
-        const svbool_t pg = svwhilelt_b32_s32(i, n);
-        svst1_f32(pg, y + i, svmul_f32_x(pg, ggml_v_silu(pg, svld1_f32(pg, x + i)), svld1_f32(pg, g + i)));
-    }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-    for (; i + 3 < n; i += 4) {
-        vst1q_f32(y + i, vmulq_f32(ggml_v_silu(vld1q_f32(x + i)), vld1q_f32(g + i)));
-    }
-#elif defined(__riscv_v_intrinsic)
-    for (int vl; i < n; i += vl) {
-        vl = __riscv_vsetvl_e32m2(n - i);
-        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
-        vfloat32m2_t vg = __riscv_vle32_v_f32m2(&g[i], vl);
-        vfloat32m2_t vy = __riscv_vfmul_vv_f32m2(ggml_v_silu_m2(vx, vl), vg, vl);
-        __riscv_vse32_v_f32m2(&y[i], vy, vl);
-    }
-#endif
-    for (; i < n; ++i) {
-        y[i] = ggml_silu_f32(x[i]) * g[i];
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_siluf(x[i]) * g[i];   // Anomly exact profile: deterministic
 }
 
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {

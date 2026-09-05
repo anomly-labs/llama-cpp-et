@@ -6,3 +6,6 @@
 // exact-quire b-posit8 W8A8 matmul (src0 bposit8 weights, src1 f32 activations quantised on
 // device with the reference quantiser, dst f32). Bit-identical to ggml_vec_dot_bposit8_bposit8.
 void ggml_cuda_mul_mat_bposit8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// exact f16 x f16 matmul (src1 f32 rounded to f16 on device), same readout as the CPU ggml_vec_dot_f16
+void ggml_cuda_mul_mat_f16_exact(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "det.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -125,20 +126,51 @@ static __global__ void rms_norm_f32(const float * x,
         add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
     }
 
-    float tmp = 0.0f; // partial sum for thread in warp
+    // Anomly exact profile: exact sum of squares (ggml-det 640-bit integer), reduced across
+    // the block as lazily-carried 64-bit limbs, then a fixed IEEE scale sequence identical to
+    // the CPU backend (ggml_det_rms_scale): rows are bit-identical between CPU and CUDA.
+    __shared__ unsigned long long s_limb[DET_BIG_LIMBS][block_size / WARP_SIZE];
+    __shared__ float s_scale;
+    uint32_t acc[DET_BIG_LIMBS];
+    det_big_zero(acc);
+    bool bad = false;
 
     ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
+        if (!det_big_add_sq(acc, x[col])) bad = true;
     }
-
-    // sum up partial sums
-    extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-    const float mean = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
+    {
+        const int warp_id = tid / WARP_SIZE, lane_id = tid % WARP_SIZE;
+        #pragma unroll
+        for (int l = 0; l < DET_BIG_LIMBS; l++) {
+            unsigned long long v = acc[l];
+            #pragma unroll
+            for (int off = WARP_SIZE / 2; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off, WARP_SIZE);
+            if (lane_id == 0) s_limb[l][warp_id] = v;
+        }
+        bad = __any_sync(0xffffffff, bad);
+        if (lane_id == 0 && bad) s_limb[0][warp_id] |= 0x8000000000000000ull;   // poison marker (a limb sum never reaches 2^63)
+    }
+    __syncthreads();
+    if (tid == 0) {
+        uint32_t tot[DET_BIG_LIMBS];
+        unsigned long long carry = 0;
+        bool anybad = false;
+        for (int l = 0; l < DET_BIG_LIMBS; l++) {
+            unsigned long long v = carry;
+            for (int w = 0; w < block_size / WARP_SIZE; w++) {
+                unsigned long long p = s_limb[l][w];
+                if (l == 0 && (p >> 63)) { anybad = true; p &= 0x7FFFFFFFFFFFFFFFull; }
+                v += p;
+            }
+            tot[l] = (uint32_t) v;
+            carry = v >> 32;
+        }
+        const double sumsq = anybad ? det_bits2d(0x7FF0000000000000ull) : det_big_to_double(tot);
+        s_scale = det_rms_scale(sumsq, ncols, eps);
+    }
+    __syncthreads();
+    const float scale = s_scale;
 
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply && do_add) {

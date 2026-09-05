@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "det.cuh"
 
 struct rope_corr_dims {
     float v[2];
@@ -59,6 +60,7 @@ static __global__ void rope_norm(const T *            x,
                                  const float          attn_factor,
                                  const rope_corr_dims corr_dims,
                                  const float          theta_scale,
+                                 const float          freq_base,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride) {
@@ -97,14 +99,19 @@ static __global__ void rope_norm(const T *            x,
         return;
     }
 
-    const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
-
-    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
-
     float cos_theta;
     float sin_theta;
-
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    if (!has_ff && ext_factor == 0.0f) {
+        // Anomly exact profile: deterministic frequencies and trig (ggml-det), identical to the CPU cache
+        det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        cos_theta = __fmul_rn(cos_theta, attn_factor);
+        sin_theta = __fmul_rn(sin_theta, attn_factor);
+        if (!forward) sin_theta = -sin_theta;
+    } else {
+        const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
+        const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    }
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + 1];
@@ -131,6 +138,7 @@ static __global__ void rope_neox(const T *            x,
                                  const float          attn_factor,
                                  const rope_corr_dims corr_dims,
                                  const float          theta_scale,
+                                 const float          freq_base,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride) {
@@ -165,14 +173,19 @@ static __global__ void rope_neox(const T *            x,
         return;
     }
 
-    const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
-
-    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
-
     float cos_theta;
     float sin_theta;
-
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    if (!has_ff && ext_factor == 0.0f) {
+        // Anomly exact profile: deterministic frequencies and trig (ggml-det), identical to the CPU cache
+        det_rope_sincos((float) pos[i2], i0/2, n_dims, freq_base, freq_scale, &sin_theta, &cos_theta);
+        cos_theta = __fmul_rn(cos_theta, attn_factor);
+        sin_theta = __fmul_rn(sin_theta, attn_factor);
+        if (!forward) sin_theta = -sin_theta;
+    } else {
+        const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
+        const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    }
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
@@ -365,11 +378,11 @@ static void rope_norm_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_base, freq_factors, row_indices, set_rows_stride);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_base, freq_factors, row_indices, set_rows_stride);
     }
 }
 
@@ -408,11 +421,11 @@ static void rope_neox_cuda(const T *            x,
     if (freq_factors == nullptr) {
         ggml_cuda_kernel_launch(rope_neox<forward, false, T, D>, launch_params,
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_base, freq_factors, row_indices, set_rows_stride);
     } else {
         ggml_cuda_kernel_launch(rope_neox<forward, true, T, D>, launch_params,
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_base, freq_factors, row_indices, set_rows_stride);
     }
 }
 

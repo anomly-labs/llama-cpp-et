@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "ggml-det-api.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -3825,14 +3826,9 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
-
-                const float mean  = sum/ne00;
-                const float scale = 1.0f/sqrtf(mean + eps);
+                // Anomly exact profile: the sum of squares is exact (ggml-det big integer) and the
+                // scale is a fixed IEEE sequence, so CPU and CUDA produce identical rows.
+                const float scale = ggml_det_rms_scale(ggml_det_sumsq_f32(x, (int) ne00), (int) ne00, eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
@@ -5476,15 +5472,11 @@ static void ggml_compute_forward_soft_max_f32(
                     max = MAX(max, sk[i02]);
                 }
 
-                ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
+                // Anomly exact profile: deterministic exp, EXACT sum, fixed normalisation (ggml-det)
+                const float sink_exp = sk ? ggml_det_expf(sk[i02] - max) : 0.0f;
+                const double sum = ggml_det_soft_max_f32(ne00, dp, wp, max, sink_exp);
                 assert(sum > 0.0);
-
-                if (sk) {
-                    sum += (ggml_float) expf(sk[i02] - max);
-                }
-
-                sum = 1.0/sum;
-                ggml_vec_scale_f32(ne00, dp, sum);
+                ggml_vec_scale_f32(ne00, dp, ggml_det_soft_max_inv(sum));
 
 #ifndef NDEBUG
                 for (int i = 0; i < ne00; ++i) {
@@ -5779,7 +5771,18 @@ static void rope_yarn(
 
 static void ggml_rope_cache_init(
      float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
-     float * cache, float sin_sign, float theta_scale) {
+     float * cache, float sin_sign, float theta_scale, float freq_base = 0.0f, int n_dims = 0) {
+    // Anomly exact profile: without YaRN / frequency factors the table is deterministic
+    // (ggml-det: exact frequencies, double reduction, fixed rounding) — identical to CUDA.
+    if (ext_factor == 0.0f && freq_factors == NULL && n_dims > 0) {
+        for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+            float s, c;
+            ggml_det_rope_sincos(theta_base, (int) (i0 / 2), n_dims, freq_base, freq_scale, &s, &c);
+            cache[i0 + 0] = c * mscale;
+            cache[i0 + 1] = s * mscale * sin_sign;
+        }
+        return;
+    }
     // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
     float theta = theta_base;
     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
@@ -5982,7 +5985,7 @@ static void ggml_compute_forward_rope_flt(
                 if (last_i2 != i2) {
                     if (!mrope_used) {
                         const int64_t p = pos[i2];
-                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale, freq_base, n_dims);
                     }
                     else {
                         const int64_t p_t = pos[i2];

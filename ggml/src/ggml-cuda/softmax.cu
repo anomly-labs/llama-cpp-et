@@ -1,6 +1,10 @@
 #include "common.cuh"
 #include "ggml.h"
 #include "softmax.cuh"
+#include "det.cuh"
+
+// static shared memory the deterministic exact-sum reduction adds to soft_max_f32 (s_limb + s_inv), reserved from the opt-in budget
+#define DET_SOFTMAX_STATIC_SMEM (DET_BIG_LIMBS * 32 * sizeof(unsigned long long) + 1024)
 
 #ifdef GGML_USE_HIP
 #include <hip/hip_cooperative_groups.h>
@@ -101,7 +105,13 @@ static __global__ void soft_max_f32(
     // find the max value in the block
     max_val = block_reduce<block_reduce_method::MAX, block_size_template>(max_val, buf_iw);
 
-    float tmp = 0.0f; // partial sum
+    // Anomly exact profile: deterministic exp (ggml-det), EXACT sum of the numerators
+    // (640-bit integer, lazily-carried limbs across warps), fixed normalisation — identical
+    // to the CPU backend's ggml_det_soft_max_f32 / ggml_det_soft_max_inv.
+    __shared__ unsigned long long s_limb[DET_BIG_LIMBS][32];
+    __shared__ float s_inv;
+    uint32_t acc[DET_BIG_LIMBS];
+    det_big_zero(acc);
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -111,19 +121,38 @@ static __global__ void soft_max_f32(
             break;
         }
 
-        const float val = expf(vals[col] - max_val);
-        tmp += val;
+        const float val = det_expf(__fsub_rn(vals[col], max_val));
+        det_big_add_f32_nonneg(acc, val);
         vals[col] = val;
     }
-
-    // find the sum of exps in the block
-    tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
-
-    if (sinks) {
-        tmp += expf(sinks[i02] - max_val);
+    if (sinks && tid == 0) {
+        det_big_add_f32_nonneg(acc, det_expf(__fsub_rn(sinks[i02], max_val)));
     }
-
-    const float inv_sum = 1.0f / tmp;
+    {
+        const int warp_id = tid / WARP_SIZE, lane_id = tid % WARP_SIZE;
+        #pragma unroll
+        for (int l = 0; l < DET_BIG_LIMBS; l++) {
+            unsigned long long v = acc[l];
+            #pragma unroll
+            for (int off = WARP_SIZE / 2; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off, WARP_SIZE);
+            if (lane_id == 0) s_limb[l][warp_id] = v;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const int nwarps = (block_size + WARP_SIZE - 1) / WARP_SIZE;
+        uint32_t tot[DET_BIG_LIMBS];
+        unsigned long long carry = 0;
+        for (int l = 0; l < DET_BIG_LIMBS; l++) {
+            unsigned long long v = carry;
+            for (int w = 0; w < nwarps; w++) v += s_limb[l][w];
+            tot[l] = (uint32_t) v;
+            carry = v >> 32;
+        }
+        s_inv = det_soft_max_inv(det_big_to_double(tot));
+    }
+    __syncthreads();
+    const float inv_sum = s_inv;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -281,7 +310,7 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
         constexpr int block = (ncols > 1024 ? 1024 : ncols);
 
         if (p.ncols == ncols) {
-            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T>), smpbo);
+            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T>), smpbo - DET_SOFTMAX_STATIC_SMEM);
             soft_max_f32<true, ncols, block><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, mask, sinks, dst, p);
             return true;
@@ -295,7 +324,7 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
     }
 
     //default case
-    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, 0, 0, T>), smpbo);
+    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, 0, 0, T>), smpbo - DET_SOFTMAX_STATIC_SMEM);
     soft_max_f32<true, 0, 0><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
 }
 
@@ -338,13 +367,13 @@ static void soft_max_f32_cuda(const float *                                x,
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
 
-    if (nbytes_shared <= smpbo) {
+    if (nbytes_shared <= smpbo - DET_SOFTMAX_STATIC_SMEM) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
     } else {
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
         // Can be adapted further for lower-SM-count GPUs, though keeping data in registers should be implemented first as that is the optimal solution.
-        if (ggml_cuda_info().devices[id].supports_cooperative_launch &&
+        if (false && ggml_cuda_info().devices[id].supports_cooperative_launch && // Anomly: deterministic path only
             ncols_x / (params.ne01 * params.ne02 * params.ne03) > 8192 && mask == nullptr && sinks == nullptr &&
             params.scale == 1.0f && params.max_bias == 0.0f) {
             ggml_cuda_pool_alloc<float> tmp_maxs_alloc(ctx.pool(), ggml_cuda_info().devices[id].nsm * sizeof(float));

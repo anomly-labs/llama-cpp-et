@@ -64,9 +64,9 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         }
         // Qcur/Kcur are re-emitted under the same name after RoPE; only the MUL_MAT output
         // is the exact unit. Tag those "Qcur_mm-<il>" / "Kcur_mm-<il>" in the dump.
-        if (!is_mm && t->op == GGML_OP_MUL_MAT &&
+        if (!is_mm && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_ROPE) &&
             (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
-            is_mm = true;
+            is_mm = true;   // post-RoPE rows are tagged Qcur_rope-<il> (deterministic RoPE gate)
         }
     }
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
@@ -88,6 +88,8 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     char tname[GGML_MAX_NAME + 8];
     if (t->op == GGML_OP_MUL_MAT && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
         snprintf(tname, sizeof(tname), "%.4s_mm-%s", t->name, t->name + 5);   // Qcur_mm-<il>
+    } else if (t->op == GGML_OP_ROPE && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
+        snprintf(tname, sizeof(tname), "%.4s_rope-%s", t->name, t->name + 5); // Qcur_rope-<il>
     } else {
         snprintf(tname, sizeof(tname), "%s", t->name);
     }

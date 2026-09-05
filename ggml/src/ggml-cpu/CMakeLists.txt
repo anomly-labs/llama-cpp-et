@@ -26,6 +26,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     ggml_add_backend_library(${GGML_CPU_NAME})
 
+    # Anomly exact profile: deterministic elementwise math (ggml-det) and no FMA contraction
+    list (APPEND GGML_CPU_SOURCES ggml-det/det.c ggml-det/ggml-det.h ggml-det/ggml-det-api.h)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
@@ -55,7 +57,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu ggml-det)
+    if (NOT MSVC)
+        target_compile_options(${GGML_CPU_NAME} PRIVATE -ffp-contract=off)
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)

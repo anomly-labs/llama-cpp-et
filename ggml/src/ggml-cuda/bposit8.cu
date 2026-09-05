@@ -15,6 +15,7 @@
 
 #include "bposit8.cuh"
 #include "bposit8-common.cuh"
+#include "det.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -135,10 +136,119 @@ static __global__ void quantize_bposit8_kernel(const float * __restrict__ x, blo
     for (int j = 0; j < QK_BPOSIT8; j++) yb->qs[j] = bp8_encode_nearest(__dmul_rn((double) v[j], inv), sv, sc);
 }
 
+
+#define BP8_WARPS_PER_BLOCK 4
+
+// ---------------------------------------------------------------------------------------
+// shared exact-accumulation machinery: 8 lazily-carried int64 limbs per lane (shared mem),
+// exact int64 warp reduction, carry normalisation mod 2^256, the ggml-det readout loop.
+// ---------------------------------------------------------------------------------------
+static __device__ __forceinline__ void exact_lane_add(int64_t * a, int64_t P, int sh) {
+    if (sh >= 0) {
+        const int w = sh >> 5, bits = sh & 31;
+        if (w < 8) {
+            const int64_t V = P << bits;
+            a[w] += (int64_t) (uint32_t) V;
+            if (w + 1 < 8) a[w + 1] += (V >> 32);
+        }
+    } else {
+        const int rs = -sh;
+        const int64_t V = rs >= 63 ? (P < 0 ? -1 : 0) : (P >> rs);
+        a[0] += V;
+    }
+}
+
+// all 32 lanes must call; the result is valid in every lane
+static __device__ __forceinline__ float exact_warp_readout(const int64_t * a) {
+    uint32_t q[8];
+    int64_t carry = 0;
+    #pragma unroll
+    for (int w = 0; w < 8; w++) {
+        int64_t v = a[w];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+        v += carry;
+        q[w] = (uint32_t) v;
+        carry = v >> 32;
+    }
+    return DET_D2F(det_q256_to_double(q));
+}
+
+// ---------------------------------------------------------------------------------------
+// exact f16 x f16 matmul (attention KQ and KQV under the exact profile): src0 f16 rows,
+// src1 f32 converted to f16 (round-to-nearest, as the CPU backend does), one warp per output
+// ---------------------------------------------------------------------------------------
+static __global__ void f32_to_f16_rows_kernel(const float * __restrict__ x, uint16_t * __restrict__ y,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t s1, const int64_t s2, const int64_t s3, const int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int64_t i0 = i % ne0; int64_t r = i / ne0;
+    const int64_t i1 = r % ne1; r /= ne1;
+    const int64_t i2 = r % ne2; const int64_t i3 = r / ne2;
+    y[i] = __half_as_ushort(__float2half_rn(x[i3 * s3 + i2 * s2 + i1 * s1 + i0]));
+}
+
+static __global__ void __launch_bounds__(32 * BP8_WARPS_PER_BLOCK)
+mul_mat_f16_exact_kernel(const uint16_t * __restrict__ x, const uint16_t * __restrict__ y, float * __restrict__ dst,
+        const int n, const int64_t ne01, const int64_t ne12,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s11, const int64_t s12, const int64_t s13,
+        const int64_t sd1, const int64_t sd2, const int64_t sd3,
+        const int r2, const int r3) {
+    __shared__ int64_t acc[32 * BP8_WARPS_PER_BLOCK][8];
+    int64_t * a = acc[threadIdx.x];
+    #pragma unroll
+    for (int w = 0; w < 8; w++) a[w] = 0;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int64_t row = (int64_t) blockIdx.x * BP8_WARPS_PER_BLOCK + warp;
+    if (row >= ne01) return;
+    const int64_t i1 = blockIdx.y;
+    const int64_t i2 = blockIdx.z % ne12, i3 = blockIdx.z / ne12;
+    const uint16_t * xr = x + (i3 / r3) * s03 + (i2 / r2) * s02 + row * s01;
+    const uint16_t * yr = y + i3 * s13 + i2 * s12 + i1 * s11;
+    for (int k = lane; k < n; k += 32) {
+        int Mx, Ex, My, Ey;
+        det_f16_to_ME(xr[k], &Mx, &Ex);
+        det_f16_to_ME(yr[k], &My, &Ey);
+        const int64_t P = (int64_t) Mx * (int64_t) My;
+        if (P != 0) exact_lane_add(a, P, Ex + Ey + DET_QFRAC);
+    }
+    const float out = exact_warp_readout(a);
+    if (lane != 0) return;
+    dst[i3 * sd3 + i2 * sd2 + i1 * sd1 + row] = out;
+}
+
+void ggml_cuda_mul_mat_f16_exact(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne10 == ne00);
+    GGML_ASSERT(nb00 == sizeof(uint16_t) && nb10 == sizeof(float) && nb0 == sizeof(float));
+    GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+    GGML_ASSERT(ne11 <= 65535 && ne12 * ne13 <= 65535);
+    cudaStream_t stream = ctx.stream();
+    const int64_t total = ne10 * ne11 * ne12 * ne13;
+    ggml_cuda_pool_alloc<char> yh(ctx.pool(), (size_t) total * sizeof(uint16_t));
+    uint16_t * yh_d = (uint16_t *) yh.get();
+    {
+        const int nthreads = 256;
+        const dim3 grid((unsigned) ((total + nthreads - 1) / nthreads));
+        f32_to_f16_rows_kernel<<<grid, nthreads, 0, stream>>>((const float *) src1->data, yh_d, ne10, ne11, ne12,
+            nb11 / sizeof(float), nb12 / sizeof(float), nb13 / sizeof(float), total);
+    }
+    {
+        const int64_t s01 = nb01 / sizeof(uint16_t), s02 = nb02 / sizeof(uint16_t), s03 = nb03 / sizeof(uint16_t);
+        const int64_t s11 = ne10, s12 = ne10 * ne11, s13 = ne10 * ne11 * ne12;
+        const int64_t sd1 = nb1 / sizeof(float), sd2 = nb2 / sizeof(float), sd3 = nb3 / sizeof(float);
+        const dim3 grid((unsigned) ((ne01 + BP8_WARPS_PER_BLOCK - 1) / BP8_WARPS_PER_BLOCK), (unsigned) ne11, (unsigned) (ne12 * ne13));
+        mul_mat_f16_exact_kernel<<<grid, 32 * BP8_WARPS_PER_BLOCK, 0, stream>>>(
+            (const uint16_t *) src0->data, yh_d, (float *) dst->data, (int) ne00, ne01, ne12,
+            s01, s02, s03, s11, s12, s13, sd1, sd2, sd3, (int) (ne12 / ne02), (int) (ne13 / ne03));
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // exact dot: one warp per output element
 // ---------------------------------------------------------------------------------------
-#define BP8_WARPS_PER_BLOCK 4
 
 static __global__ void __launch_bounds__(32 * BP8_WARPS_PER_BLOCK)
 mul_mat_bposit8_kernel(const block_bposit8 * __restrict__ x, const block_bposit8 * __restrict__ y, float * __restrict__ dst,
@@ -173,44 +283,13 @@ mul_mat_bposit8_kernel(const block_bposit8 * __restrict__ x, const block_bposit8
             const uint8_t cx = xq[j], cy = yq[j];
             const int P = (int) sM[cx] * (int) sM[cy];
             if (P == 0) continue;
-            const int sh = (int) sE[cx] + (int) sE[cy] + se;
-            if (sh >= 0) {
-                const int w = sh >> 5, bits = sh & 31;
-                if (w < 8) {
-                    const int64_t V = ((int64_t) P) << bits;
-                    a[w] += (int64_t) (uint32_t) V;
-                    if (w + 1 < 8) a[w + 1] += (V >> 32);
-                }
-            } else {
-                const int rs = -sh;
-                const int64_t V = rs >= 63 ? (P < 0 ? -1 : 0) : (((int64_t) P) >> rs);
-                a[0] += V;
-            }
+            exact_lane_add(a, P, (int) sE[cx] + (int) sE[cy] + se);
         }
     }
 
-    // exact limb-wise warp reduction + one carry normalisation (mod 2^256)
-    uint32_t q[8];
-    int64_t carry = 0;
-    #pragma unroll
-    for (int w = 0; w < 8; w++) {
-        int64_t v = a[w];
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
-        v += carry;
-        q[w] = (uint32_t) v;
-        carry = v >> 32;
-    }
+    const float out = exact_warp_readout(a);
     if (lane != 0) return;
-
-    // readout: mirrors ggml_q256_to_double (no fused multiply-add)
-    const int neg = (q[7] >> 31) & 1;
-    if (neg) { uint64_t c = 1; for (int w = 0; w < 8; w++) { const uint64_t v = (uint64_t) (~q[w]) + c; q[w] = (uint32_t) v; c = v >> 32; } }
-    double v = 0.0;
-    for (int w = 7; w >= 0; w--) v = __dadd_rn(__dmul_rn(v, 4294967296.0), (double) q[w]);
-    v = ldexp(v, -BP8_QFRAC);
-    if (neg) v = -v;
-    dst[i3 * sd3 + i2 * sd2 + i1 * sd1 + row] = __double2float_rn(v);
+    dst[i3 * sd3 + i2 * sd2 + i1 * sd1 + row] = out;
 }
 
 void ggml_cuda_mul_mat_bposit8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
