@@ -64,9 +64,9 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         }
         // Qcur/Kcur are re-emitted under the same name after RoPE; only the MUL_MAT output
         // is the exact unit. Tag those "Qcur_mm-<il>" / "Kcur_mm-<il>" in the dump.
-        if (!is_mm && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_ROPE) &&
+        if (!is_mm && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_ROPE || t->op == GGML_OP_ADD) &&
             (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
-            is_mm = true;   // post-RoPE rows are tagged Qcur_rope-<il> (deterministic RoPE gate)
+            is_mm = true;   // post-RoPE rows are tagged Qcur_rope-<il>, post-bias rows Qcur_bias-<il>
         }
     }
     static int names = -1;   // INVAR_LOGITS_NAMES=1: list every graph tensor (name, op, dims) once on stderr
@@ -118,6 +118,8 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         snprintf(tname, sizeof(tname), "%.4s_mm-%s", t->name, t->name + 5);   // Qcur_mm-<il>
     } else if (t->op == GGML_OP_ROPE && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0)) {
         snprintf(tname, sizeof(tname), "%.4s_rope-%s", t->name, t->name + 5); // Qcur_rope-<il>
+    } else if (t->op == GGML_OP_ADD && (strncmp(t->name, "Qcur-", 5) == 0 || strncmp(t->name, "Kcur-", 5) == 0 || strncmp(t->name, "Vcur-", 5) == 0)) {
+        snprintf(tname, sizeof(tname), "%.4s_bias-%s", t->name, t->name + 5); // Qcur_bias-<il> (projection bias added)
     } else {
         snprintf(tname, sizeof(tname), "%s", t->name);
     }
