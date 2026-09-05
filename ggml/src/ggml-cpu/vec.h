@@ -6,6 +6,7 @@
 #include "simd-mappings.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-det-api.h"
 
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -966,7 +967,7 @@ static const float SQRT_2_OVER_PI  = 0.79788456080286535587989211986876f;
 static const float SQRT_2_INV      = 0.70710678118654752440084436210484f;
 
 inline static float ggml_gelu_f32(float x) {
-    return 0.5f*x*(1.0f + tanhf(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)));
+    return ggml_det_geluf(x);   // Anomly exact profile: deterministic tanh-GELU, identical to CUDA
 }
 
 inline static void ggml_vec_gelu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
@@ -986,24 +987,11 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
 
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
-    uint16_t t;
-    for (int i = 0; i < n; ++i) {
-        if (x[i] <= -10.0f) {
-            y[i] = 0.0f;
-        } else if (x[i] >= 10.0f) {
-            y[i] = x[i];
-        } else {
-            ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
-            memcpy(&t, &fp16, sizeof(uint16_t));
-            y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
-        }
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_geluf(x[i]);   // Anomly exact profile: deterministic
 }
 #else
 inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
-        y[i] = ggml_gelu_f32(x[i]);
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_geluf(x[i]);   // Anomly exact profile: deterministic
 }
 #endif
 
@@ -1413,24 +1401,11 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
 
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
-    uint16_t t;
-    for (int i = 0; i < n; ++i) {
-        if (x[i] <= -10.0f) {
-            y[i] = 0.0f;
-        } else if (x[i] >= 10.0f) {
-            y[i] = x[i] * g[i];
-        } else {
-            ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
-            memcpy(&t, &fp16, sizeof(uint16_t));
-            y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]) * g[i];
-        }
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_geluf(x[i]) * g[i];   // Anomly exact profile: deterministic
 }
 #else
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
-    for (int i = 0; i < n; ++i) {
-        y[i] = ggml_gelu_f32(x[i]) * g[i];
-    }
+    for (int i = 0; i < n; ++i) y[i] = ggml_det_geluf(x[i]) * g[i];   // Anomly exact profile: deterministic
 }
 #endif
 

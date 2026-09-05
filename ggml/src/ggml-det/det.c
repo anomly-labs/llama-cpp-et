@@ -20,3 +20,5 @@ float  ggml_det_dot_f16(const uint16_t * x, const uint16_t * y, int n)    { retu
 double ggml_det_soft_max_f32(int n, float * y, const float * x, float max, float sink_exp) { return det_soft_max_f32(n, y, x, max, sink_exp); }
 float  ggml_det_soft_max_inv(double sum)                           { return det_soft_max_inv(sum); }
 void   ggml_det_rope_sincos_ff(float pos, int i, int n_dims, float fb, float fs, float ff, float * s, float * c) { det_rope_sincos_ff(pos, i, n_dims, fb, fs, ff, s, c); }
+float  ggml_det_geluf(float x)                                     { return det_geluf(x); }
+float  ggml_det_tanhf(float x)                                     { return det_tanhf(x); }

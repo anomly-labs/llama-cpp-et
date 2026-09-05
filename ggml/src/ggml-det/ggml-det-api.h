@@ -9,6 +9,8 @@ double ggml_det_sumsq_f32(const float * x, int n);
 float  ggml_det_rms_scale(double sumsq, int n, float eps);
 float  ggml_det_expf(float x);
 float  ggml_det_siluf(float x);
+float  ggml_det_geluf(float x);
+float  ggml_det_tanhf(float x);
 float  ggml_det_sigmoidf(float x);
 void   ggml_det_sincosf(float t, float * s, float * c);
 void   ggml_det_rope_sincos(float pos, int i, int n_dims, float freq_base, float freq_scale, float * s, float * c);

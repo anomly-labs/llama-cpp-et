@@ -257,6 +257,28 @@ DET_FN void det_rope_sincos_ff(float pos, int i, int n_dims, float freq_base, fl
     *c = DET_D2F(cd);
 }
 
+// tanh in double via exp: (e^{2y} - 1) / (e^{2y} + 1); saturates beyond |y| > 20
+DET_FN double det_tanh_d(double y) {
+    if (y > 20.0) return 1.0;
+    if (y < -20.0) return -1.0;
+    const double u = det_exp_d(DET_DMUL(2.0, y));
+    return DET_DDIV(DET_DSUB(u, 1.0), DET_DADD(u, 1.0));
+}
+DET_FN float det_tanhf(float x) {
+    const uint32_t b = det_f2bits(x);
+    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) return x;    // nan
+    return DET_D2F(det_tanh_d((double) x));
+}
+
+// GELU (tanh form) with ggml's constants and operation order:
+// 0.5f*x*(1.0f + tanhf(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)))
+#define DET_GELU_COEF_A    0.044715f
+#define DET_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+DET_FN float det_geluf(float x) {
+    const float inner = DET_FMUL(DET_SQRT_2_OVER_PI, DET_FMUL(x, DET_FADD(1.0f, DET_FMUL(DET_GELU_COEF_A, DET_FMUL(x, x)))));
+    return DET_FMUL(DET_FMUL(0.5f, x), DET_FADD(1.0f, det_tanhf(inner)));
+}
+
 // SiLU and sigmoid with a fixed formula: x * (1 / (1 + exp(-x)))
 DET_FN float det_sigmoidf(float x) { return DET_FDIV(1.0f, DET_FADD(1.0f, det_expf(-x))); }
 DET_FN float det_siluf(float x)    { return DET_FMUL(x, det_sigmoidf(x)); }

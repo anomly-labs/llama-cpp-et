@@ -55,8 +55,10 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     // (the exact units) so a verifier can re-execute sampled rows of each with the GGUF
     // weights: ffn_norm -> ffn_gate, ffn_up ; ffn_swiglu|ffn_gate_par -> ffn_out ;
     // attn_norm -> Vcur ; kqv_out -> attn_out.
-    static const char * mm[] = { "ffn_norm-", "ffn_gate-", "ffn_up-", "ffn_swiglu-", "ffn_gate_par-",
-                                 "ffn_out-", "attn_norm-", "Vcur-", "kqv_out-", "attn_out-", nullptr };
+    static const char * mm[] = { "ffn_norm-", "ffn_gate-", "ffn_up-", "ffn_swiglu-", "ffn_gate_par-", "ffn_geglu-",
+                                 "ffn_out-", "attn_norm-", "Vcur-", "kqv_out-", "attn_out-",
+                                 "Qcur_normed-", "Kcur_normed-", "attn_post_norm-", "sa_out-", "ffn_post_norm-",   // gemma3
+                                 nullptr };
     bool is_mm = false;
     if (matmuls) {
         for (int i = 0; mm[i]; i++) {
@@ -78,7 +80,8 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
                      || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm
                      || (matmuls && (strcmp(t->name, "inp_embd") == 0 || (strcmp(t->name, "embd") == 0 && t->op == GGML_OP_GET_ROWS)))   // layer-0 residual input
-                     || (matmuls && strcmp(t->name, "inp_tokens") == 0);
+                     || (matmuls && strcmp(t->name, "inp_tokens") == 0)
+                     || (matmuls && strcmp(t->name, "inp_scaled") == 0);   // gemma: embedding * sqrt(n_embd)
     if (ask) {
         return wanted;
     }
@@ -102,9 +105,20 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     if (!wanted || t->type != GGML_TYPE_F32) {
         return true;
     }
+    // a prompt chunk that produces no logits leaves the post-selection tensors of the last layer
+    // and the final norm/logits EMPTY (0 rows): keep the evaluation boundary with an n=0 line for
+    // the logits and skip the rest (the row index would be -1).
+    if (t->ne[1] == 0 || t->ne[0] == 0 || (t->ne[2] == 0)) {
+        if (strcmp(t->name, "result_output") == 0) {
+            FILE * f = fopen((const char *) user_data, "ab");
+            if (f) { fprintf(f, "{\"tensor\":\"result_output\",\"n\":0,\"row\":0,\"hex\":\"\"}\n"); fclose(f); }
+        }
+        return true;
+    }
     // last position = the sampled token. RoPE outputs are 3-D [head_dim, n_head, n_tokens]:
     // dump every head of the last token (ne0*ne1 values) so the row matches the matmul row.
-    const bool three_d = t->op == GGML_OP_ROPE || t->ne[2] > 1;
+    const bool per_head = strstr(t->name, "_normed") != NULL;              // [head_dim, n_head, n_tokens] even for one token
+    const bool three_d = t->op == GGML_OP_ROPE || t->ne[2] > 1 || (per_head && t->ne[1] > 1);
     const int64_t n   = three_d ? t->ne[0] * t->ne[1] : t->ne[0];
     const int64_t row = three_d ? t->ne[2] - 1 : t->ne[1] - 1;
     std::vector<float> buf((size_t) n);
