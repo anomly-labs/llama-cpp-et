@@ -9,7 +9,7 @@ sequence of IEEE round-to-nearest operations, no libm:
 | Op | CPU site | CUDA site | Method |
 |---|---|---|---|
 | RMSNorm | ops.cpp `rms_norm_f32` | norm.cu `rms_norm_f32` | exact 640-bit sum of squares → correctly rounded double → `1/sqrtf(mean+eps)` |
-| f16 matmul (KQ, KQV) | vec.cpp `ggml_vec_dot_f16` → det.c `ggml_det_dot_f16` (65,536-entry decode tables, unrolled lanes, 1.56x) | bposit8.cu `mul_mat_f16_exact` | src1 rounded to f16, exact products in the 256-bit quire, shared readout |
+| f16 matmul (KQ, KQV) | vec.cpp `ggml_vec_dot_f16` → det.c `ggml_det_dot_f16` (65,536-entry decode tables, 16-lane chunks two per step, 59 bins, zero guard — OpenEvolve round 1, 1.66x) | bposit8.cu `mul_mat_f16_exact` | src1 rounded to f16, exact products in the 256-bit quire, shared readout |
 | softmax | ops.cpp `soft_max_f32` | softmax.cu `soft_max_f32` | `det_expf`, exact integer sum, `y * (1/(float)sum)` |
 | SiLU / SwiGLU | vec.cpp | unary.cuh `silu_single` | `x * (1/(1+det_expf(-x)))` |
 | RoPE (no YaRN/ff) | ops.cpp `rope_cache_init` | rope.cu `rope_norm/neox` | freq = exp2(-2i/d · log2(base)), double Cody-Waite reduction, Taylor sin/cos |
