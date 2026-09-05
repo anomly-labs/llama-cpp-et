@@ -43,8 +43,15 @@ static void signal_handler(int) {
 // re-executes sampled lm_head rows in the exact quire; under the b-posit8 profile the
 // re-executed logits must match these bit for bit (tests/csc/csc_verify.py).
 // Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bruscoe.
+// INVAR_LOGITS_LAYERS=1 additionally captures every layer's residual-stream output
+// ("l_out-<layer>", last row) so a verifier with the same deployment can localise a
+// divergence to a layer. Those rows are NOT cross-implementation re-executable today
+// (RMSNorm, RoPE, SiLU and softmax run in float32 in the graph); see docs/SPOT-CHECK.md.
 static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0;
+    static int layers = -1;
+    if (layers < 0) { const char * ev = getenv("INVAR_LOGITS_LAYERS"); layers = (ev && ev[0] == '1') ? 1 : 0; }
+    const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
+                     || (layers && strncmp(t->name, "l_out-", 6) == 0);
     if (ask) {
         return wanted;
     }
