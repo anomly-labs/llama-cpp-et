@@ -617,6 +617,37 @@ static void ggml_bp8_init(void) {
     g_bp8_ready = 1;
 }
 
+// Sorted value table for the nearest-code search (2026-09-05, gated bit-identical against the
+// linear scan on real activations + random + tie/absorption edge rows; ~1.9x). Ties resolve
+// to the LOWEST code as the scan does; when the best distance is not strictly below |x|
+// (double absorption) the scan is used, because it returns the first code (0) in that case.
+static double  g_bp8_sv[255];
+static uint8_t g_bp8_sc[255];
+static volatile int g_bp8_sorted_ready = 0;
+static int ggml_bp8_cmp_val(const void * a, const void * b) {
+    const double x = g_bp8_val[*(const uint8_t *) a], y = g_bp8_val[*(const uint8_t *) b];
+    return (x > y) - (x < y);
+}
+static void ggml_bp8_sorted_init(void) {
+    if (g_bp8_sorted_ready) return;
+    ggml_bp8_init();
+    uint8_t codes[255]; int n = 0;
+    for (int c = 0; c < 256; c++) if (c != BP8_NAR) codes[n++] = (uint8_t) c;
+    qsort(codes, n, 1, ggml_bp8_cmp_val);
+    for (int i = 0; i < n; i++) { g_bp8_sc[i] = codes[i]; g_bp8_sv[i] = g_bp8_val[codes[i]]; }
+    g_bp8_sorted_ready = 1;
+}
+static uint8_t ggml_bp8_encode_scan(double x, int bounded) {
+    uint8_t best = BP8_ZERO; double bestd = INFINITY;
+    for (int c = 0; c < 256; c++) {
+        if (c == BP8_NAR) continue;
+        if (bounded && g_bp8_absT[c] > 12) continue;
+        double d = fabs(g_bp8_val[c] - x);
+        if (d < bestd) { bestd = d; best = (uint8_t) c; }
+    }
+    return best;
+}
+
 // round-to-nearest encode: the finite bp8 code whose value is closest to x.
 static uint8_t ggml_bp8_encode_nearest(double x) {
     ggml_bp8_init();
@@ -627,14 +658,17 @@ static uint8_t ggml_bp8_encode_nearest(double x) {
     // Used only to measure the PPL cost of bounding; NOT a shipped code path.
     static int bounded = -1;
     if (bounded < 0) { const char * ev = getenv("ANOMLY_BP8_BOUNDED"); bounded = (ev && ev[0] == '1') ? 1 : 0; }
-    uint8_t best = BP8_ZERO;
-    double  bestd = INFINITY;
-    for (int c = 0; c < 256; c++) {
-        if (c == BP8_NAR) continue;                  // NaR is never a quantization target
-        if (bounded && g_bp8_absT[c] > 12) continue; // bounded mode: skip |T|>12 codes
-        double d = fabs(g_bp8_val[c] - x);
-        if (d < bestd) { bestd = d; best = (uint8_t) c; }
+    if (bounded) return ggml_bp8_encode_scan(x, 1);  // experiment path: keep the scan
+    ggml_bp8_sorted_init();
+    int lo = 0, hi = 255;
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (g_bp8_sv[mid] < x) lo = mid + 1; else hi = mid; }
+    uint8_t best = BP8_ZERO; double bestd = INFINITY;
+    for (int k = lo - 1; k <= lo + 1; k++) {
+        if (k < 0 || k > 254) continue;
+        double d = fabs(g_bp8_sv[k] - x);
+        if (d < bestd || (d == bestd && g_bp8_sc[k] < best)) { bestd = d; best = g_bp8_sc[k]; }
     }
+    if (!(bestd < fabs(x))) return ggml_bp8_encode_scan(x, 0);
     return best;
 }
 
