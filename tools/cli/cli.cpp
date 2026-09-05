@@ -69,18 +69,28 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
             is_mm = true;   // post-RoPE rows are tagged Qcur_rope-<il> (deterministic RoPE gate)
         }
     }
+    static int names = -1;   // INVAR_LOGITS_NAMES=1: list every graph tensor (name, op, dims) once on stderr
+    if (names < 0) { const char * ev = getenv("INVAR_LOGITS_NAMES"); names = (ev && ev[0] == '1') ? 1 : 0; }
+    if (names == 1 && ask) {
+        fprintf(stderr, "[invar-names] %s op=%s ne=%lld,%lld,%lld type=%s\n", t->name, ggml_op_name(t->op),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], ggml_type_name(t->type));
+    }
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
-                     || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm;
+                     || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm
+                     || (matmuls && strcmp(t->name, "inp_embd") == 0);   // layer-0 residual input
     if (ask) {
         return wanted;
     }
     if (!wanted || t->type != GGML_TYPE_F32) {
         return true;
     }
-    const int64_t n = t->ne[0];
-    const int64_t row = t->ne[1] - 1;                   // last position = the sampled token
+    // last position = the sampled token. RoPE outputs are 3-D [head_dim, n_head, n_tokens]:
+    // dump every head of the last token (ne0*ne1 values) so the row matches the matmul row.
+    const bool three_d = t->op == GGML_OP_ROPE || t->ne[2] > 1;
+    const int64_t n   = three_d ? t->ne[0] * t->ne[1] : t->ne[0];
+    const int64_t row = three_d ? t->ne[2] - 1 : t->ne[1] - 1;
     std::vector<float> buf((size_t) n);
-    ggml_backend_tensor_get(t, buf.data(), (size_t) row * t->nb[1], (size_t) n * sizeof(float));
+    ggml_backend_tensor_get(t, buf.data(), (size_t) row * (three_d ? t->nb[2] : t->nb[1]), (size_t) n * sizeof(float));
     FILE * f = fopen((const char *) user_data, "ab");
     if (!f) {
         return true;
@@ -96,7 +106,7 @@ static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) 
     if (t->op == GGML_OP_ROPE && t->src[1] && t->src[1]->type == GGML_TYPE_I32) {
         // the position of the dumped row (src[1] = positions), so a verifier can re-execute RoPE
         int32_t pos = -1;
-        const int64_t prow = row < t->src[1]->ne[0] ? row : t->src[1]->ne[0] - 1;
+        const int64_t prow = row < t->src[1]->ne[0] ? row : t->src[1]->ne[0] - 1;   // row = last token
         ggml_backend_tensor_get(t->src[1], &pos, (size_t) prow * sizeof(int32_t), sizeof(int32_t));
         fprintf(f, "{\"tensor\":\"%s\",\"n\":%lld,\"row\":%lld,\"pos\":%d,\"hex\":\"", tname, (long long) n, (long long) row, pos);
     } else {
