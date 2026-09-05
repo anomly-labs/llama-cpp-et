@@ -48,10 +48,23 @@ static void signal_handler(int) {
 // divergence to a layer. Those rows are NOT cross-implementation re-executable today
 // (RMSNorm, RoPE, SiLU and softmax run in float32 in the graph); see docs/SPOT-CHECK.md.
 static bool invar_logits_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    static int layers = -1;
+    static int layers = -1, matmuls = -1;
     if (layers < 0) { const char * ev = getenv("INVAR_LOGITS_LAYERS"); layers = (ev && ev[0] == '1') ? 1 : 0; }
+    if (matmuls < 0) { const char * ev = getenv("INVAR_LOGITS_MATMULS"); matmuls = (ev && ev[0] == '1') ? 1 : 0; }
+    // INVAR_LOGITS_MATMULS=1: the inputs and outputs of every FFN / attention-output matmul
+    // (the exact units) so a verifier can re-execute sampled rows of each with the GGUF
+    // weights: ffn_norm -> ffn_gate, ffn_up ; ffn_swiglu|ffn_gate_par -> ffn_out ;
+    // attn_norm -> Vcur ; kqv_out -> attn_out.
+    static const char * mm[] = { "ffn_norm-", "ffn_gate-", "ffn_up-", "ffn_swiglu-", "ffn_gate_par-",
+                                 "ffn_out-", "attn_norm-", "Vcur-", "kqv_out-", "attn_out-", nullptr };
+    bool is_mm = false;
+    if (matmuls) {
+        for (int i = 0; mm[i]; i++) {
+            if (strncmp(t->name, mm[i], strlen(mm[i])) == 0) { is_mm = true; break; }
+        }
+    }
     const bool wanted = strcmp(t->name, "result_norm") == 0 || strcmp(t->name, "result_output") == 0
-                     || (layers && strncmp(t->name, "l_out-", 6) == 0);
+                     || (layers && strncmp(t->name, "l_out-", 6) == 0) || is_mm;
     if (ask) {
         return wanted;
     }
