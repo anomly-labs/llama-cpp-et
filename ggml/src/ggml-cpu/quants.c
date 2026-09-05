@@ -610,16 +610,20 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp + GGML_BP8_QFRAC;
         const uint8_t * GGML_RESTRICT xq = x[ib].qs;
         const uint8_t * GGML_RESTRICT yq = y[ib].qs;
-        for (int j = 0; j < qk; j++) {
-            const int64_t P = g_bp8_lut_M[xq[j]] * g_bp8_lut_M[yq[j]];   // 0 when either is zero/NaR
-            if (P == 0) continue;
-            const int shift = g_bp8_lut_E[xq[j]] + g_bp8_lut_E[yq[j]] + se;
-            if (shift >= 0 && shift < GGML_BP8_SHIFT_MAX) {
-                bins[shift] += P;
-            } else {
-                ggml_q256_add_shifted(quire, P, shift);                 // sub-radix: per-term truncation
-            }
+        // 8-way unrolled lanes (OpenEvolve bp8_vecdot_speed round 3, +5-9% on x86); per-lane
+        // semantics identical to the scalar loop: bin for shift >= 0, per-term placement otherwise.
+#define GGML_BP8_LANE(k) do { \
+            const int64_t P_ = g_bp8_lut_M[xq[j + (k)]] * g_bp8_lut_M[yq[j + (k)]]; \
+            if (P_ != 0) { \
+                const int sh_ = g_bp8_lut_E[xq[j + (k)]] + g_bp8_lut_E[yq[j + (k)]] + se; \
+                if (sh_ >= 0 && sh_ < GGML_BP8_SHIFT_MAX) bins[sh_] += P_; \
+                else ggml_q256_add_shifted(quire, P_, sh_); \
+            } } while (0)
+        for (int j = 0; j < qk; j += 8) {
+            GGML_BP8_LANE(0); GGML_BP8_LANE(1); GGML_BP8_LANE(2); GGML_BP8_LANE(3);
+            GGML_BP8_LANE(4); GGML_BP8_LANE(5); GGML_BP8_LANE(6); GGML_BP8_LANE(7);
         }
+#undef GGML_BP8_LANE
     }
     // Flush the bins. OpenEvolve (workspace bp8_vecdot_speed, 2026-09-05) found that a plain
     // scan of the 512 bins beats tracking touched bins (no hit[] bookkeeping in the hot loop);
