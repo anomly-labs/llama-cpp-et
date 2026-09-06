@@ -1,3 +1,26 @@
+# llama-cpp-et — deterministic fork (Anomly)
+
+This is [AIFoundry's ET-Core llama.cpp](https://github.com/aifoundry-org/llama.cpp) with Anomly's
+**exact, deterministic inference profile** on top:
+
+- `GGML_TYPE_BPOSIT8` (tensor type 43, file type 42): 8-bit b-posit weights in 32-code blocks with a
+  power-of-two scale, every matmul accumulated in a 256-bit quire and rounded once (CPU and CUDA).
+- `ggml-det`: a deterministic elementwise library (RMSNorm, softmax, SiLU/SwiGLU, GELU/GEGLU, RoPE,
+  exact f16 attention dots) so the **whole graph is bit-identical on x86, CUDA and aarch64**.
+- `INVAR_LOGITS_OUT` dumps of every evaluation's rows and logits for independent re-execution.
+
+The arithmetic is specified in [EXACT-PROFILE-SPEC.md](https://github.com/anomly-labs/invar/blob/main/docs/EXACT-PROFILE-SPEC.md)
+and reproduced by two independent implementations (Python, Go) in [INVAR](https://github.com/anomly-labs/invar).
+Build notes and results: `docs/anomly/deterministic-graph.md`. Honest throughput: the exact profile is
+slower than q8_0 in this fork today (roughly 3x on CPU at small model sizes); the exact accumulation
+itself runs at BF16 tensor-core parity in [mosyne-bposit](https://github.com/anomly-labs/mosyne-bposit),
+and moving this runtime onto that path is engineering, not a property of the method.
+
+Licence: MIT (llama.cpp) for the upstream code; Anomly's additions are under the same licence unless a
+file states otherwise. `Copyright (c) 2026 Anomly, Inc.` on Anomly-authored files.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
