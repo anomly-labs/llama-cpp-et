@@ -4,6 +4,7 @@
 # default (exact-profile) CUDA backend, run the canonical prompt through the public 0.5B b-posit8
 # GGUF, print the whole-graph dump hash and the board verdict. One marker line at the end.
 set -uo pipefail
+export PATH=/usr/local/cuda/bin:$PATH CUDACXX=/usr/local/cuda/bin/nvcc
 export DEBIAN_FRONTEND=noninteractive
 BOARD=96edc94d772072a9
 say(){ echo ">> $*"; }
