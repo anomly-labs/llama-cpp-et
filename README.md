@@ -9,6 +9,13 @@ This is [AIFoundry's ET-Core llama.cpp](https://github.com/aifoundry-org/llama.c
   exact f16 attention dots) so the **whole graph is bit-identical on x86, CUDA and aarch64**.
 - `INVAR_LOGITS_OUT` dumps of every evaluation's rows and logits for independent re-execution.
 
+**Build:** `cmake -B build && cmake --build build -j` (add `-DGGML_CUDA=ON` for NVIDIA). A default
+build is the exact profile: the CMake forces off every path that would replace the exact kernels
+with float accumulation (llamafile tinyBLAS, BLAS/Accelerate, Metal, Vulkan, KleidiAI, HIP, SYCL,
+OpenCL), so builds on different machines, compilers and instruction sets produce the same bits.
+`-DANOMLY_ALLOW_INEXACT_BACKENDS=ON` re-enables them for experiments; those builds are outside
+the profile and their receipts do not verify. Covered today: the CPU backend (any ISA) and CUDA.
+
 The arithmetic is specified in [EXACT-PROFILE-SPEC.md](https://github.com/anomly-labs/invar/blob/main/docs/EXACT-PROFILE-SPEC.md)
 and reproduced by two independent implementations (Python, Go) in [INVAR](https://github.com/anomly-labs/invar).
 Build notes and results: `docs/anomly/deterministic-graph.md`. Honest throughput: the exact profile is

@@ -273,6 +273,21 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"      
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
 
 option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
+
+# Anomly exact profile (llama-cpp-et): every backend or fast path that replaces the exact kernels
+# with float accumulation is forced OFF, so a DEFAULT build is always in the exact profile
+# (bit-identical across machines). llamafile's tinyBLAS, in particular, silently takes over the
+# f16 attention matmuls with FMA accumulation when it is on. Opt out only for experiments; the
+# results then leave the profile and its receipts do not verify.
+option(ANOMLY_ALLOW_INEXACT_BACKENDS "llama-cpp-et: allow llamafile/BLAS/Accelerate/Metal/Vulkan/KleidiAI/HIP/SYCL/OpenCL (NOT the exact profile)" OFF)
+if (NOT ANOMLY_ALLOW_INEXACT_BACKENDS)
+    foreach (opt GGML_LLAMAFILE GGML_BLAS GGML_ACCELERATE GGML_METAL GGML_VULKAN GGML_CPU_KLEIDIAI GGML_HIP GGML_SYCL GGML_OPENCL GGML_ZENDNN GGML_HEXAGON)
+        if (${opt})
+            message(STATUS "llama-cpp-et exact profile: forcing ${opt}=OFF (override with -DANOMLY_ALLOW_INEXACT_BACKENDS=ON; results then leave the exact profile)")
+        endif()
+        set(${opt} OFF CACHE BOOL "forced OFF by the llama-cpp-et exact profile" FORCE)
+    endforeach()
+endif()
 option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
 # extra artifacts

@@ -9,6 +9,7 @@ The golden dot is Sum_j (Mx*My) * 2^(Ex+Ey+sx+sy), computed in Python
 Fraction, then expressed as an exact 256-bit / 96-frac fixed-point quire
 integer (the canonical Anomly quire) for bit-exact comparison with C.
 """
+import os
 import sys
 from fractions import Fraction
 
@@ -152,7 +153,7 @@ out.append("};")
 out.append(f"#define BP8_ONE_CODE {one_code}")
 
 hdr = "\n".join(out) + "\n"
-with open("/tmp/claude-1000/-home-nrydev-server1-development-space-time/3773cf63-9ae3-4c60-a739-e137131a1c30/scratchpad/bp8_dot_golden.h", "w") as f:
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bp8_dot_golden.h"), "w") as f:
     f.write(hdr)
 
 print(f"LUT: 256 codes, {len(cases)} dot cases emitted.")
