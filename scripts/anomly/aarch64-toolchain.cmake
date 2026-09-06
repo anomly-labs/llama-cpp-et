@@ -2,7 +2,14 @@
 # no-sudo relocated Ubuntu cross toolchain (see ~/development/cross/aarch64), static binaries for qemu-aarch64 / the Ultra96
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
-set(R "/home/nrydev_server1/development/cross/aarch64/root")
+# Relocated Ubuntu aarch64 sysroot (see docs/anomly/deterministic-graph.md); override with -DAARCH64_SYSROOT=...
+if(NOT DEFINED AARCH64_SYSROOT)
+  set(AARCH64_SYSROOT "$ENV{AARCH64_SYSROOT}")
+endif()
+if(AARCH64_SYSROOT STREQUAL "")
+  message(FATAL_ERROR "set AARCH64_SYSROOT (env or -D) to the relocated aarch64 sysroot")
+endif()
+set(R "${AARCH64_SYSROOT}")
 set(CMAKE_C_COMPILER   ${R}/usr/bin/aarch64-linux-gnu-gcc-13)
 set(CMAKE_CXX_COMPILER ${R}/usr/bin/aarch64-linux-gnu-g++-13)
 set(CMAKE_AR     ${R}/usr/bin/aarch64-linux-gnu-ar)
