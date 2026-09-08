@@ -114,10 +114,10 @@ static ggml_et_cpu_compare_config glu_cpu_compare_config = {
 };
 
 static ggml_et_cpu_compare_config mul_mat_cpu_compare_config = {
-    /* .enabled = */ false,
+    /* .enabled = */ true,    // ANOMLY bit-exact gate (temporary): compare every MUL_MAT against the CPU path
     /* .use_cpu_result = */ false,
     /* .log_differences = */ true,
-    /* .tolerance = */ 0.01,
+    /* .tolerance = */ 0.0f,
     /* .max_log_elements = */ 4096
 };
 
@@ -783,6 +783,10 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         node->src[1]->type == GGML_TYPE_F32) {
         kernel_name = "mul_mat_Q5_K";  // N < 53, or M % 16 != 0, or K % 256 != 0
         src0_type_name = "Q5_K";
+    } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_BPOSIT8 &&
+               node->src[1]->type == GGML_TYPE_F32) {
+        kernel_name    = "mul_mat_bposit8";   // exact 256-bit quire W8A8 (Anomly), bit-identical to the CPU path
+        src0_type_name = "BPOSIT8";
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q8_0 &&
                node->src[1]->type == GGML_TYPE_F32) {
         kernel_name    = "mul_mat_Q8_0";

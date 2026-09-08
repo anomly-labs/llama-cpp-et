@@ -981,7 +981,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 supported = src0_first_dim_contiguous && src1_first_dim_contiguous && dst_first_dim_contiguous &&
                             dst_properly_ordered;
-            } else if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1] &&
+            } else if (op->type == GGML_TYPE_F32 && op->src[0] && (op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_BPOSIT8) && op->src[1] &&
                        op->src[1]->type == GGML_TYPE_F32) {
                 // Keep the existing quantized path constraints separate from the
                 // relaxed non-quant generic fallback.
