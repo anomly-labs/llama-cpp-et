@@ -571,11 +571,15 @@ static double ggml_q256_to_double(const uint32_t q[8]) {
 // out of the dot inner loop. Idempotent init (all threads fill the same values).
 static int64_t g_bp8_lut_M[256];
 static int     g_bp8_lut_E[256];
+static int32_t g_bp8_lut_M32[256];   // same lattice as 32-bit lanes, for SIMD gathers
+static int32_t g_bp8_lut_E32[256];
 static volatile int g_bp8_lut_ready = 0;
 static void ggml_bp8_lut_init(void) {
     if (g_bp8_lut_ready) return;
     for (int c = 0; c < 256; c++) {
         ggml_bp8_code_to_ME((uint8_t) c, &g_bp8_lut_M[c], &g_bp8_lut_E[c]);
+        g_bp8_lut_M32[c] = (int32_t) g_bp8_lut_M[c];
+        g_bp8_lut_E32[c] = (int32_t) g_bp8_lut_E[c];
     }
     g_bp8_lut_ready = 1;
 }
@@ -591,7 +595,7 @@ static void ggml_bp8_lut_init(void) {
 // bp8_vecdot_speed, evaluator gate); 6.9x median throughput on x86.
 #define GGML_BP8_SHIFT_MAX 512   // shift = Ex+Ey+se+96 with |E| <= 31, |se| <= 254 -> < 512
 
-void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_bposit8_bposit8_scalar(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK_BPOSIT8;
@@ -650,6 +654,160 @@ void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         if (bins[i] != 0) ggml_q256_add_shifted(quire, bins[i], i);
     }
     *s = (float) ggml_q256_to_double(quire);
+}
+
+// ---------------------------------------------------------------------------
+// Vectorised exact-quire dot (AVX-512 VBMI, 2026-09-09). Per 32-block: every code's (M, E)
+// comes from 256-entry byte tables held in registers (vpermi2b, two per table + one blend for
+// 64 codes), P = M_x*M_y (|P| < 2^10) is a 16-bit lane product, sh = E_x+E_y+se a 16-bit lane
+// sum. The block is anchored at its smallest shift over the non-zero products and summed
+// EXACTLY in int64 lanes as P << (sh - smin) (vpsllvq); the block sum goes into a 128-bit bin
+// keyed by smin, and the bins are placed into the quire once at the end. Every step is a pure
+// left shift or an integer addition, so the integer that reaches the quire is the same one the
+// scalar kernel builds term by term: bit-identical by construction. Headroom: rel <= 48 keeps
+// |P << rel| < 2^58, 32 terms < 2^63, and a 128-bit bin holds any number of blocks. Blocks
+// that exceed that range, or contain a sub-radix term (smin < 0, where the scalar kernel
+// truncates PER TERM), take the scalar per-term path for that block. Gate (random, extreme,
+// forced-fallback, sub-radix, huge-shift and permuted rows, vector == scalar bit for bit):
+// tests/bposit8-quire-ref/bp8_vec_gate.c.
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+#include <immintrin.h>
+#define GGML_BP8_VEC_REL_MAX 48
+
+static int8_t g_bp8_lut_M8[256];
+static int8_t g_bp8_lut_E8[256];
+static volatile int g_bp8_lut8_ready = 0;
+static void ggml_bp8_lut8_init(void) {
+    if (g_bp8_lut8_ready) return;
+    ggml_bp8_lut_init();
+    for (int c = 0; c < 256; c++) { g_bp8_lut_M8[c] = (int8_t) g_bp8_lut_M[c]; g_bp8_lut_E8[c] = (int8_t) g_bp8_lut_E[c]; }
+    g_bp8_lut8_ready = 1;
+}
+
+// 256-entry byte table lookup for 64 indices: bits [6:0] select within two 64-byte halves,
+// bit 7 selects the half.
+static inline __m512i ggml_bp8_lut256(__m512i idx, __m512i t0, __m512i t1, __m512i t2, __m512i t3) {
+    const __m512i lo = _mm512_permutex2var_epi8(t0, idx, t1);
+    const __m512i hi = _mm512_permutex2var_epi8(t2, idx, t3);
+    return _mm512_mask_blend_epi8(_mm512_movepi8_mask(idx), lo, hi);
+}
+
+// v = hi*2^64 + lo (lo unsigned) placed at bit `shift` of the quire.
+static inline void ggml_q256_add_shifted_128(uint32_t q[8], unsigned __int128 v, int shift) {
+    const uint64_t lo = (uint64_t) v, hi = (uint64_t)(v >> 64);
+    if (lo) {   // unsigned low half: place as two 32-bit pieces to keep add_shifted's int64 contract
+        ggml_q256_add_shifted(q, (int64_t)(lo & 0xFFFFFFFFull), shift);
+        ggml_q256_add_shifted(q, (int64_t)(lo >> 32), shift + 32);
+    }
+    if (hi) ggml_q256_add_shifted(q, (int64_t) hi, shift + 64);   // signed high half
+}
+
+static inline int ggml_bp8_hmin_epi16(__m512i v) {
+    __m256i a = _mm256_min_epi16(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+    __m128i b = _mm_min_epi16(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+    b = _mm_min_epi16(b, _mm_shuffle_epi32(b, _MM_SHUFFLE(1, 0, 3, 2)));
+    b = _mm_min_epi16(b, _mm_shuffle_epi32(b, _MM_SHUFFLE(2, 3, 0, 1)));
+    b = _mm_min_epi16(b, _mm_shufflelo_epi16(b, _MM_SHUFFLE(2, 3, 0, 1)));
+    return (int16_t) _mm_cvtsi128_si32(b);
+}
+static inline int ggml_bp8_hmax_epi16(__m512i v) {
+    __m256i a = _mm256_max_epi16(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+    __m128i b = _mm_max_epi16(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+    b = _mm_max_epi16(b, _mm_shuffle_epi32(b, _MM_SHUFFLE(1, 0, 3, 2)));
+    b = _mm_max_epi16(b, _mm_shuffle_epi32(b, _MM_SHUFFLE(2, 3, 0, 1)));
+    b = _mm_max_epi16(b, _mm_shufflelo_epi16(b, _MM_SHUFFLE(2, 3, 0, 1)));
+    return (int16_t) _mm_cvtsi128_si32(b);
+}
+
+static void ggml_vec_dot_bposit8_bposit8_avx512(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    const int qk = QK_BPOSIT8;
+    const int nb = n / qk;
+    ggml_bp8_lut8_init();
+    const block_bposit8 * GGML_RESTRICT x = vx;
+    const block_bposit8 * GGML_RESTRICT y = vy;
+    uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    __int128 bins[GGML_BP8_SHIFT_MAX];
+    memset(bins, 0, sizeof bins);
+    int bin_lo = GGML_BP8_SHIFT_MAX, bin_hi = -1;                       // touched range, for the flush
+    const __m512i big16 = _mm512_set1_epi16(0x3FFF), nbig16 = _mm512_set1_epi16(-0x3FFF);
+    const __m512i M0 = _mm512_loadu_si512(g_bp8_lut_M8), M1 = _mm512_loadu_si512(g_bp8_lut_M8 + 64);
+    const __m512i M2 = _mm512_loadu_si512(g_bp8_lut_M8 + 128), M3 = _mm512_loadu_si512(g_bp8_lut_M8 + 192);
+    const __m512i E0 = _mm512_loadu_si512(g_bp8_lut_E8), E1 = _mm512_loadu_si512(g_bp8_lut_E8 + 64);
+    const __m512i E2 = _mm512_loadu_si512(g_bp8_lut_E8 + 128), E3 = _mm512_loadu_si512(g_bp8_lut_E8 + 192);
+    const __m512i zero16 = _mm512_setzero_si512();
+    for (int ib = 0; ib < nb; ib += 2) {
+        // two blocks (64 codes) per register; a trailing single block is zero-padded (P = 0)
+        __m512i ix, iy;
+        if (ib + 1 < nb) {
+            // blocks are 33 bytes apart: gather the two 32-byte code runs
+            ix = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x[ib].qs)), _mm256_loadu_si256((const __m256i *) x[ib + 1].qs), 1);
+            iy = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[ib].qs)), _mm256_loadu_si256((const __m256i *) y[ib + 1].qs), 1);
+        } else {
+            ix = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x[ib].qs));
+            iy = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[ib].qs));
+            ix = _mm512_inserti64x4(ix, _mm256_setzero_si256(), 1);
+            iy = _mm512_inserti64x4(iy, _mm256_setzero_si256(), 1);
+        }
+        const __m512i mx8 = ggml_bp8_lut256(ix, M0, M1, M2, M3), my8 = ggml_bp8_lut256(iy, M0, M1, M2, M3);
+        const __m512i ex8 = ggml_bp8_lut256(ix, E0, E1, E2, E3), ey8 = ggml_bp8_lut256(iy, E0, E1, E2, E3);
+        for (int h = 0; h < 2; h++) {
+            const int jb = ib + h;
+            if (jb >= nb) break;
+            const int se = (int) x[jb].scale_exp + (int) y[jb].scale_exp + GGML_BP8_QFRAC;
+            const __m256i mxh = h ? _mm512_extracti64x4_epi64(mx8, 1) : _mm512_castsi512_si256(mx8);
+            const __m256i myh = h ? _mm512_extracti64x4_epi64(my8, 1) : _mm512_castsi512_si256(my8);
+            const __m256i exh = h ? _mm512_extracti64x4_epi64(ex8, 1) : _mm512_castsi512_si256(ex8);
+            const __m256i eyh = h ? _mm512_extracti64x4_epi64(ey8, 1) : _mm512_castsi512_si256(ey8);
+            const __m512i P16  = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(mxh), _mm512_cvtepi8_epi16(myh));
+            const __m512i SH16 = _mm512_add_epi16(_mm512_add_epi16(_mm512_cvtepi8_epi16(exh), _mm512_cvtepi8_epi16(eyh)), _mm512_set1_epi16((short) se));
+            const __mmask32 nz = _mm512_cmpneq_epi16_mask(P16, zero16);
+            if (nz == 0) continue;
+            // range of the shifts over the non-zero products, in 16-bit lanes
+            const int smin = ggml_bp8_hmin_epi16(_mm512_mask_blend_epi16(nz, big16,  SH16));
+            const int smax = ggml_bp8_hmax_epi16(_mm512_mask_blend_epi16(nz, nbig16, SH16));
+            if (smin < 0 || smax - smin > GGML_BP8_VEC_REL_MAX || smin >= GGML_BP8_SHIFT_MAX) {
+                int16_t pv[32], sv[32];
+                _mm512_storeu_si512(pv, P16); _mm512_storeu_si512(sv, SH16);
+                for (int k = 0; k < 32; k++) if (pv[k] != 0) ggml_q256_add_shifted(quire, (int64_t) pv[k], sv[k]);
+                continue;
+            }
+            // anchored exact sum: P << (sh - smin) in int64 lanes, straight from the 16-bit lanes
+            const __m512i rel16 = _mm512_sub_epi16(SH16, _mm512_set1_epi16((short) smin));   // zero-P lanes: any value
+            const __m128i p0 = _mm512_castsi512_si128(P16),  p1 = _mm512_extracti32x4_epi32(P16, 1),  p2 = _mm512_extracti32x4_epi32(P16, 2),  p3 = _mm512_extracti32x4_epi32(P16, 3);
+            const __m128i r0 = _mm512_castsi512_si128(rel16), r1 = _mm512_extracti32x4_epi32(rel16, 1), r2 = _mm512_extracti32x4_epi32(rel16, 2), r3 = _mm512_extracti32x4_epi32(rel16, 3);
+            __m512i acc = _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p0), _mm512_cvtepi16_epi64(r0));
+            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p1), _mm512_cvtepi16_epi64(r1)));
+            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p2), _mm512_cvtepi16_epi64(r2)));
+            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p3), _mm512_cvtepi16_epi64(r3)));
+            bins[smin] += (__int128) _mm512_reduce_add_epi64(acc);
+            if (smin < bin_lo) bin_lo = smin;
+            if (smin > bin_hi) bin_hi = smin;
+        }
+    }
+    for (int i = bin_lo; i <= bin_hi; i++) {
+        if (bins[i] != 0) ggml_q256_add_shifted_128(quire, (unsigned __int128) bins[i], i);
+    }
+    *s = (float) ggml_q256_to_double(quire);
+}
+#endif // AVX-512 VBMI
+
+// Dispatcher: the vector path where the build has it, the scalar reference otherwise or
+// when GGML_BP8_SCALAR is set in the environment (A/B and gate runs).
+void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+    static int use_scalar = -1;
+    if (use_scalar < 0) use_scalar = getenv("GGML_BP8_SCALAR") != NULL;
+    if (!use_scalar) {
+        assert(n % QK_BPOSIT8 == 0); assert(nrc == 1);
+        UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+        ggml_vec_dot_bposit8_bposit8_avx512(n, s, vx, vy);
+        return;
+    }
+#endif
+    ggml_vec_dot_bposit8_bposit8_scalar(n, s, bs, vx, bx, vy, by, nrc);
 }
 
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
