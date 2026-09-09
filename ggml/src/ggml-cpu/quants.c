@@ -671,7 +671,14 @@ void ggml_vec_dot_bposit8_bposit8_scalar(int n, float * GGML_RESTRICT s, size_t 
 // forced-fallback, sub-radix, huge-shift and permuted rows, vector == scalar bit for bit):
 // tests/bposit8-quire-ref/bp8_vec_gate.c.
 #if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+#define GGML_BP8_HAVE_VEC 1
 #include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#define GGML_BP8_HAVE_VEC 1
+#include <arm_neon.h>
+#endif
+
+#if defined(GGML_BP8_HAVE_VEC)
 #define GGML_BP8_VEC_REL_MAX 48
 
 static int8_t g_bp8_lut_M8[256];
@@ -684,14 +691,6 @@ static void ggml_bp8_lut8_init(void) {
     g_bp8_lut8_ready = 1;
 }
 
-// 256-entry byte table lookup for 64 indices: bits [6:0] select within two 64-byte halves,
-// bit 7 selects the half.
-static inline __m512i ggml_bp8_lut256(__m512i idx, __m512i t0, __m512i t1, __m512i t2, __m512i t3) {
-    const __m512i lo = _mm512_permutex2var_epi8(t0, idx, t1);
-    const __m512i hi = _mm512_permutex2var_epi8(t2, idx, t3);
-    return _mm512_mask_blend_epi8(_mm512_movepi8_mask(idx), lo, hi);
-}
-
 // v = hi*2^64 + lo (lo unsigned) placed at bit `shift` of the quire.
 static inline void ggml_q256_add_shifted_128(uint32_t q[8], unsigned __int128 v, int shift) {
     const uint64_t lo = (uint64_t) v, hi = (uint64_t)(v >> 64);
@@ -701,6 +700,17 @@ static inline void ggml_q256_add_shifted_128(uint32_t q[8], unsigned __int128 v,
     }
     if (hi) ggml_q256_add_shifted(q, (int64_t) hi, shift + 64);   // signed high half
 }
+#endif // GGML_BP8_HAVE_VEC
+
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+// 256-entry byte table lookup for 64 indices: bits [6:0] select within two 64-byte halves,
+// bit 7 selects the half.
+static inline __m512i ggml_bp8_lut256(__m512i idx, __m512i t0, __m512i t1, __m512i t2, __m512i t3) {
+    const __m512i lo = _mm512_permutex2var_epi8(t0, idx, t1);
+    const __m512i hi = _mm512_permutex2var_epi8(t2, idx, t3);
+    return _mm512_mask_blend_epi8(_mm512_movepi8_mask(idx), lo, hi);
+}
+
 
 static inline int ggml_bp8_hmin_epi16(__m512i v) {
     __m256i a = _mm256_min_epi16(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
@@ -792,18 +802,109 @@ static void ggml_vec_dot_bposit8_bposit8_avx512(int n, float * GGML_RESTRICT s,
 }
 #endif // AVX-512 VBMI
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// NEON (AArch64) form of the same anchored-block kernel: (M, E) byte tables in registers
+// (four vqtbl4q lookups per 16 codes per table, out-of-range indices read as 0 so the four
+// 64-entry quarters OR together), int16 products via vmull_s8, per-block anchor from vminvq /
+// vmaxvq over the non-zero lanes, exact int64 lane sums via vshlq_s64 with per-lane shifts,
+// 128-bit bins by anchor. Same integer as the scalar kernel; same gate.
+typedef struct { uint8x16x4_t q[4]; } ggml_bp8_tbl256;
+static inline void ggml_bp8_tbl256_load(ggml_bp8_tbl256 * t, const int8_t * tab) {
+    for (int k = 0; k < 4; k++) t->q[k] = vld1q_u8_x4((const uint8_t *) tab + 64 * k);
+}
+static inline int8x16_t ggml_bp8_lut256_neon(const ggml_bp8_tbl256 * t, uint8x16_t idx) {
+    const uint8x16_t c64 = vdupq_n_u8(64);
+    uint8x16_t r = vqtbl4q_u8(t->q[0], idx);
+    idx = vsubq_u8(idx, c64); r = vorrq_u8(r, vqtbl4q_u8(t->q[1], idx));
+    idx = vsubq_u8(idx, c64); r = vorrq_u8(r, vqtbl4q_u8(t->q[2], idx));
+    idx = vsubq_u8(idx, c64); r = vorrq_u8(r, vqtbl4q_u8(t->q[3], idx));
+    return vreinterpretq_s8_u8(r);
+}
+// P << rel for 8 int16 lanes into an int64x2 accumulator pair (exact: |P| < 2^10, rel <= 48)
+static inline void ggml_bp8_acc8_neon(int64x2_t * a0, int64x2_t * a1, int16x8_t p16, int16x8_t rel16) {
+    const int32x4_t pl = vmovl_s16(vget_low_s16(p16)),  ph = vmovl_high_s16(p16);
+    const int32x4_t rl = vmovl_s16(vget_low_s16(rel16)), rh = vmovl_high_s16(rel16);
+    *a0 = vaddq_s64(*a0, vshlq_s64(vmovl_s32(vget_low_s32(pl)), vmovl_s32(vget_low_s32(rl))));
+    *a1 = vaddq_s64(*a1, vshlq_s64(vmovl_high_s32(pl),          vmovl_high_s32(rl)));
+    *a0 = vaddq_s64(*a0, vshlq_s64(vmovl_s32(vget_low_s32(ph)), vmovl_s32(vget_low_s32(rh))));
+    *a1 = vaddq_s64(*a1, vshlq_s64(vmovl_high_s32(ph),          vmovl_high_s32(rh)));
+}
+
+static void ggml_vec_dot_bposit8_bposit8_neon(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    const int qk = QK_BPOSIT8;
+    const int nb = n / qk;
+    ggml_bp8_lut8_init();
+    const block_bposit8 * GGML_RESTRICT x = vx;
+    const block_bposit8 * GGML_RESTRICT y = vy;
+    uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    __int128 bins[GGML_BP8_SHIFT_MAX];
+    memset(bins, 0, sizeof bins);
+    int bin_lo = GGML_BP8_SHIFT_MAX, bin_hi = -1;
+    ggml_bp8_tbl256 TM, TE;
+    ggml_bp8_tbl256_load(&TM, g_bp8_lut_M8);
+    ggml_bp8_tbl256_load(&TE, g_bp8_lut_E8);
+    const int16x8_t big16 = vdupq_n_s16(0x3FFF), nbig16 = vdupq_n_s16(-0x3FFF);
+    for (int ib = 0; ib < nb; ib++) {
+        const int se = (int) x[ib].scale_exp + (int) y[ib].scale_exp + GGML_BP8_QFRAC;
+        const int16x8_t vse = vdupq_n_s16((int16_t) se);
+        int16x8_t P[4], SH[4];
+        int16x8_t vmin = big16, vmax = nbig16;
+        for (int h = 0; h < 2; h++) {                      // two 16-code halves
+            const uint8x16_t ix = vld1q_u8(x[ib].qs + 16 * h), iy = vld1q_u8(y[ib].qs + 16 * h);
+            const int8x16_t mx = ggml_bp8_lut256_neon(&TM, ix), my = ggml_bp8_lut256_neon(&TM, iy);
+            const int8x16_t ex = ggml_bp8_lut256_neon(&TE, ix), ey = ggml_bp8_lut256_neon(&TE, iy);
+            const int8x16_t e8 = vaddq_s8(ex, ey);           // E_x+E_y in [-64, 54]: fits int8
+            P[2 * h]      = vmull_s8(vget_low_s8(mx), vget_low_s8(my));
+            P[2 * h + 1]  = vmull_high_s8(mx, my);
+            SH[2 * h]     = vaddq_s16(vmovl_s8(vget_low_s8(e8)), vse);
+            SH[2 * h + 1] = vaddq_s16(vmovl_high_s8(e8), vse);
+            for (int q = 2 * h; q < 2 * h + 2; q++) {
+                const uint16x8_t nz = vmvnq_u16(vceqzq_s16(P[q]));
+                vmin = vminq_s16(vmin, vbslq_s16(nz, SH[q], big16));
+                vmax = vmaxq_s16(vmax, vbslq_s16(nz, SH[q], nbig16));
+            }
+        }
+        const int smin = vminvq_s16(vmin), smax = vmaxvq_s16(vmax);
+        if (smin == 0x3FFF) continue;                          // all-zero block
+        if (smin < 0 || smax - smin > GGML_BP8_VEC_REL_MAX || smin >= GGML_BP8_SHIFT_MAX) {
+            int16_t pv[8], sv[8];
+            for (int q = 0; q < 4; q++) {
+                vst1q_s16(pv, P[q]); vst1q_s16(sv, SH[q]);
+                for (int k = 0; k < 8; k++) if (pv[k] != 0) ggml_q256_add_shifted(quire, (int64_t) pv[k], sv[k]);
+            }
+            continue;
+        }
+        const int16x8_t vsmin = vdupq_n_s16((int16_t) smin);
+        int64x2_t a0 = vdupq_n_s64(0), a1 = vdupq_n_s64(0);
+        for (int q = 0; q < 4; q++) ggml_bp8_acc8_neon(&a0, &a1, P[q], vsubq_s16(SH[q], vsmin));
+        bins[smin] += (__int128) vaddvq_s64(vaddq_s64(a0, a1));
+        if (smin < bin_lo) bin_lo = smin;
+        if (smin > bin_hi) bin_hi = smin;
+    }
+    for (int i = bin_lo; i <= bin_hi; i++) {
+        if (bins[i] != 0) ggml_q256_add_shifted_128(quire, (unsigned __int128) bins[i], i);
+    }
+    *s = (float) ggml_q256_to_double(quire);
+}
+#endif // NEON
+
 // Dispatcher: the vector path where the build has it, the scalar reference otherwise or
 // when GGML_BP8_SCALAR is set in the environment (A/B and gate runs).
 void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by, int nrc) {
-#if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+#if defined(GGML_BP8_HAVE_VEC)
     static int use_scalar = -1;
     if (use_scalar < 0) use_scalar = getenv("GGML_BP8_SCALAR") != NULL;
     if (!use_scalar) {
         assert(n % QK_BPOSIT8 == 0); assert(nrc == 1);
         UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
         ggml_vec_dot_bposit8_bposit8_avx512(n, s, vx, vy);
+#else
+        ggml_vec_dot_bposit8_bposit8_neon(n, s, vx, vy);
+#endif
         return;
     }
 #endif
