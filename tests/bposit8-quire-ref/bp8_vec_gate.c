@@ -64,6 +64,22 @@ int main(void) {
             checked++;
             if (f2u(sp) != f2u(sv)) { bad++; if (!why[0]) snprintf(why, sizeof why, "trial %d: permuted %08x vs %08x", trial, f2u(sp), f2u(sv)); }
         }
+        // 2x2 tile: rows (x, x') x columns (y, y') must equal four single dots, and the scalar tile
+        if (nb >= 1 && trial % 2 == 0) {
+            block_bposit8 * x2 = calloc(nb, sizeof *x2), * y2 = calloc(nb, sizeof *y2);
+            for (int ib = 0; ib < nb; ib++) { fill_block(&x2[ib], 0, -20, 10); fill_block(&y2[ib], 0, -20, 10); }
+            block_bposit8 * xx = calloc(2 * nb, sizeof *xx), * yy = calloc(2 * nb, sizeof *yy);
+            memcpy(xx, x, nb * sizeof *x); memcpy(xx + nb, x2, nb * sizeof *x); memcpy(yy, y, nb * sizeof *y); memcpy(yy + nb, y2, nb * sizeof *y);
+            float tile[2 * 16] = { 0 }, ref[4], st[2 * 16] = { 0 };
+            ggml_vec_dot_bposit8_bposit8(n, tile, 16, xx, nb * sizeof *xx, yy, nb * sizeof *yy, 2);
+            ggml_vec_dot_bposit8_bposit8_scalar(n, &ref[0], 0, x, 0, y, 0, 1);  ggml_vec_dot_bposit8_bposit8_scalar(n, &ref[1], 0, x2, 0, y, 0, 1);
+            ggml_vec_dot_bposit8_bposit8_scalar(n, &ref[2], 0, x, 0, y2, 0, 1); ggml_vec_dot_bposit8_bposit8_scalar(n, &ref[3], 0, x2, 0, y2, 0, 1);
+            checked += 4;
+            if (f2u(tile[0]) != f2u(ref[0]) || f2u(tile[1]) != f2u(ref[1]) || f2u(tile[16]) != f2u(ref[2]) || f2u(tile[17]) != f2u(ref[3])) {
+                bad++; if (!why[0]) snprintf(why, sizeof why, "trial %d: 2x2 tile differs from single dots", trial);
+            }
+            free(x2); free(y2); free(xx); free(yy); (void) st;
+        }
         free(x); free(y);
     }
     // throughput on REALISTIC rows: codes nearest to Gaussian samples (what quantize_row makes of

@@ -729,76 +729,101 @@ static inline int ggml_bp8_hmax_epi16(__m512i v) {
     return (int16_t) _mm_cvtsi128_si32(b);
 }
 
+// One (weight row, activation column) pair's 32-block: exact anchored sum into its bin set, or
+// the per-term path. Shared by the single and the 2x2 kernels.
+typedef struct { uint32_t quire[8]; __int128 bins[GGML_BP8_SHIFT_MAX]; int lo, hi; } ggml_bp8_acc;
+static inline void ggml_bp8_acc_init(ggml_bp8_acc * a) { memset(a, 0, sizeof *a); a->lo = GGML_BP8_SHIFT_MAX; a->hi = -1; }
+static inline float ggml_bp8_acc_readout(ggml_bp8_acc * a) {
+    for (int i = a->lo; i <= a->hi; i++) if (a->bins[i] != 0) ggml_q256_add_shifted_128(a->quire, (unsigned __int128) a->bins[i], i);
+    return (float) ggml_q256_to_double(a->quire);
+}
+static inline void ggml_bp8_block_avx512(ggml_bp8_acc * a, __m512i mx16, __m512i my16, __m512i e16, int se) {
+    const __m512i P16  = _mm512_mullo_epi16(mx16, my16);
+    const __m512i SH16 = _mm512_add_epi16(e16, _mm512_set1_epi16((short) se));
+    const __mmask32 nz = _mm512_cmpneq_epi16_mask(P16, _mm512_setzero_si512());
+    if (nz == 0) return;
+    const int smin = ggml_bp8_hmin_epi16(_mm512_mask_blend_epi16(nz, _mm512_set1_epi16(0x3FFF),  SH16));
+    const int smax = ggml_bp8_hmax_epi16(_mm512_mask_blend_epi16(nz, _mm512_set1_epi16(-0x3FFF), SH16));
+    if (smin < 0 || smax - smin > GGML_BP8_VEC_REL_MAX || smin >= GGML_BP8_SHIFT_MAX) {
+        int16_t pv[32], sv[32];
+        _mm512_storeu_si512(pv, P16); _mm512_storeu_si512(sv, SH16);
+        for (int k = 0; k < 32; k++) if (pv[k] != 0) ggml_q256_add_shifted(a->quire, (int64_t) pv[k], sv[k]);
+        return;
+    }
+    const __m512i rel16 = _mm512_sub_epi16(SH16, _mm512_set1_epi16((short) smin));
+    const __m128i p0 = _mm512_castsi512_si128(P16),  p1 = _mm512_extracti32x4_epi32(P16, 1),  p2 = _mm512_extracti32x4_epi32(P16, 2),  p3 = _mm512_extracti32x4_epi32(P16, 3);
+    const __m128i r0 = _mm512_castsi512_si128(rel16), r1 = _mm512_extracti32x4_epi32(rel16, 1), r2 = _mm512_extracti32x4_epi32(rel16, 2), r3 = _mm512_extracti32x4_epi32(rel16, 3);
+    __m512i acc = _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p0), _mm512_cvtepi16_epi64(r0));
+    acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p1), _mm512_cvtepi16_epi64(r1)));
+    acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p2), _mm512_cvtepi16_epi64(r2)));
+    acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p3), _mm512_cvtepi16_epi64(r3)));
+    a->bins[smin] += (__int128) _mm512_reduce_add_epi64(acc);
+    if (smin < a->lo) a->lo = smin;
+    if (smin > a->hi) a->hi = smin;
+}
+// 64 codes -> (M, E) as two 512-bit int8 vectors
+#define GGML_BP8_DECODE64(idx, M, E) do { \
+        M = ggml_bp8_lut256((idx), M0, M1, M2, M3); E = ggml_bp8_lut256((idx), E0, E1, E2, E3); } while (0)
+#define GGML_BP8_TABLES \
+    const __m512i M0 = _mm512_loadu_si512(g_bp8_lut_M8), M1 = _mm512_loadu_si512(g_bp8_lut_M8 + 64); \
+    const __m512i M2 = _mm512_loadu_si512(g_bp8_lut_M8 + 128), M3 = _mm512_loadu_si512(g_bp8_lut_M8 + 192); \
+    const __m512i E0 = _mm512_loadu_si512(g_bp8_lut_E8), E1 = _mm512_loadu_si512(g_bp8_lut_E8 + 64); \
+    const __m512i E2 = _mm512_loadu_si512(g_bp8_lut_E8 + 128), E3 = _mm512_loadu_si512(g_bp8_lut_E8 + 192);
+static inline __m512i ggml_bp8_load2(const block_bposit8 * x, int ib, int nb) {   // codes of blocks ib, ib+1 (zero-padded)
+    __m512i v = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x[ib].qs));
+    return _mm512_inserti64x4(v, ib + 1 < nb ? _mm256_loadu_si256((const __m256i *) x[ib + 1].qs) : _mm256_setzero_si256(), 1);
+}
+#define GGML_BP8_HALF(v, h) ((h) ? _mm512_extracti64x4_epi64((v), 1) : _mm512_castsi512_si256(v))
+
 static void ggml_vec_dot_bposit8_bposit8_avx512(int n, float * GGML_RESTRICT s,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
-    const int qk = QK_BPOSIT8;
-    const int nb = n / qk;
+    const int nb = n / QK_BPOSIT8;
     ggml_bp8_lut8_init();
     const block_bposit8 * GGML_RESTRICT x = vx;
     const block_bposit8 * GGML_RESTRICT y = vy;
-    uint32_t quire[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    __int128 bins[GGML_BP8_SHIFT_MAX];
-    memset(bins, 0, sizeof bins);
-    int bin_lo = GGML_BP8_SHIFT_MAX, bin_hi = -1;                       // touched range, for the flush
-    const __m512i big16 = _mm512_set1_epi16(0x3FFF), nbig16 = _mm512_set1_epi16(-0x3FFF);
-    const __m512i M0 = _mm512_loadu_si512(g_bp8_lut_M8), M1 = _mm512_loadu_si512(g_bp8_lut_M8 + 64);
-    const __m512i M2 = _mm512_loadu_si512(g_bp8_lut_M8 + 128), M3 = _mm512_loadu_si512(g_bp8_lut_M8 + 192);
-    const __m512i E0 = _mm512_loadu_si512(g_bp8_lut_E8), E1 = _mm512_loadu_si512(g_bp8_lut_E8 + 64);
-    const __m512i E2 = _mm512_loadu_si512(g_bp8_lut_E8 + 128), E3 = _mm512_loadu_si512(g_bp8_lut_E8 + 192);
-    const __m512i zero16 = _mm512_setzero_si512();
+    ggml_bp8_acc a; ggml_bp8_acc_init(&a);
+    GGML_BP8_TABLES
     for (int ib = 0; ib < nb; ib += 2) {
-        // two blocks (64 codes) per register; a trailing single block is zero-padded (P = 0)
-        __m512i ix, iy;
-        if (ib + 1 < nb) {
-            // blocks are 33 bytes apart: gather the two 32-byte code runs
-            ix = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x[ib].qs)), _mm256_loadu_si256((const __m256i *) x[ib + 1].qs), 1);
-            iy = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[ib].qs)), _mm256_loadu_si256((const __m256i *) y[ib + 1].qs), 1);
-        } else {
-            ix = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x[ib].qs));
-            iy = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[ib].qs));
-            ix = _mm512_inserti64x4(ix, _mm256_setzero_si256(), 1);
-            iy = _mm512_inserti64x4(iy, _mm256_setzero_si256(), 1);
-        }
-        const __m512i mx8 = ggml_bp8_lut256(ix, M0, M1, M2, M3), my8 = ggml_bp8_lut256(iy, M0, M1, M2, M3);
-        const __m512i ex8 = ggml_bp8_lut256(ix, E0, E1, E2, E3), ey8 = ggml_bp8_lut256(iy, E0, E1, E2, E3);
-        for (int h = 0; h < 2; h++) {
-            const int jb = ib + h;
-            if (jb >= nb) break;
-            const int se = (int) x[jb].scale_exp + (int) y[jb].scale_exp + GGML_BP8_QFRAC;
-            const __m256i mxh = h ? _mm512_extracti64x4_epi64(mx8, 1) : _mm512_castsi512_si256(mx8);
-            const __m256i myh = h ? _mm512_extracti64x4_epi64(my8, 1) : _mm512_castsi512_si256(my8);
-            const __m256i exh = h ? _mm512_extracti64x4_epi64(ex8, 1) : _mm512_castsi512_si256(ex8);
-            const __m256i eyh = h ? _mm512_extracti64x4_epi64(ey8, 1) : _mm512_castsi512_si256(ey8);
-            const __m512i P16  = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(mxh), _mm512_cvtepi8_epi16(myh));
-            const __m512i SH16 = _mm512_add_epi16(_mm512_add_epi16(_mm512_cvtepi8_epi16(exh), _mm512_cvtepi8_epi16(eyh)), _mm512_set1_epi16((short) se));
-            const __mmask32 nz = _mm512_cmpneq_epi16_mask(P16, zero16);
-            if (nz == 0) continue;
-            // range of the shifts over the non-zero products, in 16-bit lanes
-            const int smin = ggml_bp8_hmin_epi16(_mm512_mask_blend_epi16(nz, big16,  SH16));
-            const int smax = ggml_bp8_hmax_epi16(_mm512_mask_blend_epi16(nz, nbig16, SH16));
-            if (smin < 0 || smax - smin > GGML_BP8_VEC_REL_MAX || smin >= GGML_BP8_SHIFT_MAX) {
-                int16_t pv[32], sv[32];
-                _mm512_storeu_si512(pv, P16); _mm512_storeu_si512(sv, SH16);
-                for (int k = 0; k < 32; k++) if (pv[k] != 0) ggml_q256_add_shifted(quire, (int64_t) pv[k], sv[k]);
-                continue;
-            }
-            // anchored exact sum: P << (sh - smin) in int64 lanes, straight from the 16-bit lanes
-            const __m512i rel16 = _mm512_sub_epi16(SH16, _mm512_set1_epi16((short) smin));   // zero-P lanes: any value
-            const __m128i p0 = _mm512_castsi512_si128(P16),  p1 = _mm512_extracti32x4_epi32(P16, 1),  p2 = _mm512_extracti32x4_epi32(P16, 2),  p3 = _mm512_extracti32x4_epi32(P16, 3);
-            const __m128i r0 = _mm512_castsi512_si128(rel16), r1 = _mm512_extracti32x4_epi32(rel16, 1), r2 = _mm512_extracti32x4_epi32(rel16, 2), r3 = _mm512_extracti32x4_epi32(rel16, 3);
-            __m512i acc = _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p0), _mm512_cvtepi16_epi64(r0));
-            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p1), _mm512_cvtepi16_epi64(r1)));
-            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p2), _mm512_cvtepi16_epi64(r2)));
-            acc = _mm512_add_epi64(acc, _mm512_sllv_epi64(_mm512_cvtepi16_epi64(p3), _mm512_cvtepi16_epi64(r3)));
-            bins[smin] += (__int128) _mm512_reduce_add_epi64(acc);
-            if (smin < bin_lo) bin_lo = smin;
-            if (smin > bin_hi) bin_hi = smin;
+        __m512i mx8, ex8, my8, ey8;
+        GGML_BP8_DECODE64(ggml_bp8_load2(x, ib, nb), mx8, ex8);
+        GGML_BP8_DECODE64(ggml_bp8_load2(y, ib, nb), my8, ey8);
+        for (int h = 0; h < 2 && ib + h < nb; h++) {
+            const int se = (int) x[ib + h].scale_exp + (int) y[ib + h].scale_exp + GGML_BP8_QFRAC;
+            ggml_bp8_block_avx512(&a, _mm512_cvtepi8_epi16(GGML_BP8_HALF(mx8, h)), _mm512_cvtepi8_epi16(GGML_BP8_HALF(my8, h)),
+                _mm512_add_epi16(_mm512_cvtepi8_epi16(GGML_BP8_HALF(ex8, h)), _mm512_cvtepi8_epi16(GGML_BP8_HALF(ey8, h))), se);
         }
     }
-    for (int i = bin_lo; i <= bin_hi; i++) {
-        if (bins[i] != 0) ggml_q256_add_shifted_128(quire, (unsigned __int128) bins[i], i);
+    *s = ggml_bp8_acc_readout(&a);
+}
+
+// 2x2 micro-tile for the matmul: weight rows x0, x1 (stride bx) against activation columns
+// y0, y1 (stride by); each code is decoded once and used by two pairs. s[r + bs*c].
+static void ggml_vec_dot_bposit8_bposit8_avx512_2x2(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by) {
+    const int nb = n / QK_BPOSIT8;
+    ggml_bp8_lut8_init();
+    const block_bposit8 * GGML_RESTRICT x0 = vx, * GGML_RESTRICT x1 = (const block_bposit8 *)((const uint8_t *) vx + bx);
+    const block_bposit8 * GGML_RESTRICT y0 = vy, * GGML_RESTRICT y1 = (const block_bposit8 *)((const uint8_t *) vy + by);
+    ggml_bp8_acc a00, a10, a01, a11;
+    ggml_bp8_acc_init(&a00); ggml_bp8_acc_init(&a10); ggml_bp8_acc_init(&a01); ggml_bp8_acc_init(&a11);
+    GGML_BP8_TABLES
+    for (int ib = 0; ib < nb; ib++) {
+        // pack (x0 block, x1 block) and (y0 block, y1 block) into one register each: one decode per operand
+        __m512i mx, ex, my, ey;
+        GGML_BP8_DECODE64(_mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) x0[ib].qs)), _mm256_loadu_si256((const __m256i *) x1[ib].qs), 1), mx, ex);
+        GGML_BP8_DECODE64(_mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y0[ib].qs)), _mm256_loadu_si256((const __m256i *) y1[ib].qs), 1), my, ey);
+        const __m512i mx0 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(mx, 0)), mx1 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(mx, 1));
+        const __m512i my0 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(my, 0)), my1 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(my, 1));
+        const __m512i ex0 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(ex, 0)), ex1 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(ex, 1));
+        const __m512i ey0 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(ey, 0)), ey1 = _mm512_cvtepi8_epi16(GGML_BP8_HALF(ey, 1));
+        const int sx0 = x0[ib].scale_exp, sx1 = x1[ib].scale_exp, sy0 = y0[ib].scale_exp, sy1 = y1[ib].scale_exp;
+        ggml_bp8_block_avx512(&a00, mx0, my0, _mm512_add_epi16(ex0, ey0), sx0 + sy0 + GGML_BP8_QFRAC);
+        ggml_bp8_block_avx512(&a10, mx1, my0, _mm512_add_epi16(ex1, ey0), sx1 + sy0 + GGML_BP8_QFRAC);
+        ggml_bp8_block_avx512(&a01, mx0, my1, _mm512_add_epi16(ex0, ey1), sx0 + sy1 + GGML_BP8_QFRAC);
+        ggml_bp8_block_avx512(&a11, mx1, my1, _mm512_add_epi16(ex1, ey1), sx1 + sy1 + GGML_BP8_QFRAC);
     }
-    *s = (float) ggml_q256_to_double(quire);
+    s[0] = ggml_bp8_acc_readout(&a00); s[1] = ggml_bp8_acc_readout(&a10);
+    s[bs] = ggml_bp8_acc_readout(&a01); s[bs + 1] = ggml_bp8_acc_readout(&a11);
 }
 #endif // AVX-512 VBMI
 
@@ -894,21 +919,32 @@ static void ggml_vec_dot_bposit8_bposit8_neon(int n, float * GGML_RESTRICT s,
 void ggml_vec_dot_bposit8_bposit8(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1 || nrc == 2);
 #if defined(GGML_BP8_HAVE_VEC)
     static int use_scalar = -1;
     if (use_scalar < 0) use_scalar = getenv("GGML_BP8_SCALAR") != NULL;
     if (!use_scalar) {
-        assert(n % QK_BPOSIT8 == 0); assert(nrc == 1);
-        UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+        assert(n % QK_BPOSIT8 == 0);
 #if defined(__AVX512VBMI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+        if (nrc == 2) { ggml_vec_dot_bposit8_bposit8_avx512_2x2(n, s, bs, vx, bx, vy, by); return; }
         ggml_vec_dot_bposit8_bposit8_avx512(n, s, vx, vy);
-#else
-        ggml_vec_dot_bposit8_bposit8_neon(n, s, vx, vy);
-#endif
         return;
+#else
+        if (nrc == 1) { ggml_vec_dot_bposit8_bposit8_neon(n, s, vx, vy); return; }
+        // NEON: no 2x2 tile yet; four single dots, same s layout
+        ggml_vec_dot_bposit8_bposit8_neon(n, s,          vx, vy);
+        ggml_vec_dot_bposit8_bposit8_neon(n, s + 1,      (const uint8_t *) vx + bx, vy);
+        ggml_vec_dot_bposit8_bposit8_neon(n, s + bs,     vx, (const uint8_t *) vy + by);
+        ggml_vec_dot_bposit8_bposit8_neon(n, s + bs + 1, (const uint8_t *) vx + bx, (const uint8_t *) vy + by);
+        return;
+#endif
     }
 #endif
-    ggml_vec_dot_bposit8_bposit8_scalar(n, s, bs, vx, bx, vy, by, nrc);
+    if (nrc == 1) { ggml_vec_dot_bposit8_bposit8_scalar(n, s, 0, vx, 0, vy, 0, 1); return; }
+    ggml_vec_dot_bposit8_bposit8_scalar(n, s,          0, vx, 0, vy, 0, 1);
+    ggml_vec_dot_bposit8_bposit8_scalar(n, s + 1,      0, (const uint8_t *) vx + bx, 0, vy, 0, 1);
+    ggml_vec_dot_bposit8_bposit8_scalar(n, s + bs,     0, vx, 0, (const uint8_t *) vy + by, 0, 1);
+    ggml_vec_dot_bposit8_bposit8_scalar(n, s + bs + 1, 0, (const uint8_t *) vx + bx, 0, (const uint8_t *) vy + by, 0, 1);
 }
 
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

@@ -282,7 +282,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_bposit8,
         .vec_dot                  = ggml_vec_dot_bposit8_bposit8,
         .vec_dot_type             = GGML_TYPE_BPOSIT8,
-        .nrows                    = 1,
+        .nrows                    = 2,   // 2x2 micro-tile (shared code decode); every path handles nrc=2
     },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
