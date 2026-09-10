@@ -43,7 +43,8 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
         for (int be = 0; be < 2; be++) {
             ggml_init_params ip = { 64 * 1024 * 1024, nullptr, true };
             ggml_context * ctx = ggml_init(ip);
-            const int ne0 = 32 * (1 + (t % 24)), ne1 = 1 + (t % 7), ne2 = 1 + (t % 3);
+            // ne0: multiples of 32 and odd sizes (softmax rows are the KV length, any integer; norms/glu any width)
+            const int ne0 = (t % 5 == 4) ? (1 + (t * 7919) % 700) : 32 * (1 + (t % 24)), ne1 = 1 + (t % 7), ne2 = 1 + (t % 3);
             ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2);
             ggml_tensor * y = nullptr; ggml_tensor * w = nullptr; ggml_tensor * m = nullptr; ggml_tensor * pos = nullptr; ggml_tensor * g = nullptr; ggml_tensor * ins_extra = nullptr; ggml_tensor * ins_rows = nullptr;
             rng = 0xABCDEF1234567ull + t;                       // same data on both backends
@@ -52,6 +53,7 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
             if (variant == 1) { w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0); y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w); }
             if (variant == 2) { m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, ne1); y = ggml_soft_max_ext(ctx, x, m, 0.125f, 0.0f); }
             if (variant == 3) { y = ggml_soft_max_ext(ctx, x, nullptr, 1.0f, 0.0f); }
+            if ((variant == 4 || variant == 5) && (ne0 % 2)) { ggml_free(ctx); continue; }
             if (variant == 4 || variant == 5) { pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne2); y = ggml_rope_ext(ctx, x, pos, nullptr, ne0 / 2 * 2 > 64 ? 64 : ne0 / 2 * 2, variant == 5 ? GGML_ROPE_TYPE_NEOX : 0, 4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f); }
             if (variant == 6) { g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2); y = ggml_swiglu_split(ctx, x, g); }
             if (variant == 7) { y = ggml_silu(ctx, x); }
