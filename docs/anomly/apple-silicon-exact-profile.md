@@ -63,8 +63,9 @@ The host-side software double is itself gated against hardware double on 2 × 10
 integer/soft-double b-posit8 path against `libggml-cpu` on 3 × 10⁵ rows (both on Linux; sources in
 the Anomly `space-time` repo, `research/metal-exact/`).
 
-Speed, SmolLM2-135M, 4 CPU threads: Metal build 61.7 prompt / 7.3 generation t/s versus the CPU
-build's 37.1 / 11.7. Prompt processing gains from the GPU matmuls; single-token generation loses
-to the per-op CPU↔GPU hand-offs of the declined ops. Moving RMSNorm, softmax, RoPE and the
+Speed, SmolLM2-135M (`llama-bench -p 256 -n 64 -t 8`): Metal build pp256 **90.6** t/s, tg64
+**16.7** t/s; CPU exact build pp256 74.6, tg64 54.7. Prompt processing gains from the GPU matmuls;
+single-token generation is 3.3× slower than the CPU build because every declined op is a
+CPU↔GPU hand-off. Moving RMSNorm, softmax, RoPE and the
 activations onto the GPU with the same software-double discipline is the next step; the f16
 attention matmuls would follow the same accumulate-and-read-out pattern.
