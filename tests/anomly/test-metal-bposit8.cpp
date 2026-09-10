@@ -15,7 +15,7 @@
 
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 static uint64_t r64() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng * 0x2545F4914F6CDD1Dull; }
-static float rf() { int k = r64() % 4; if (k == 0) return ((int)(r64() % 20001) - 10000) / 1000.0f; if (k == 1) return ldexpf(1.0f, (int)(r64() % 40) - 20) * ((r64() & 1) ? -1 : 1); if (k == 2) return (r64() % 5 == 0) ? 0.0f : ((int)(r64() % 7) - 3) * 0.25f; return (float)((double)(int64_t)(r64() >> 40) / 8388608.0) * ((r64() & 1) ? -1 : 1); }
+static float rf() { int k = r64() % 5; if (k == 4) { uint32_t b = (uint32_t) (r64() & 0x807FFFFFu) | ((r64() % 3 == 0) ? 0u : ((uint32_t) (1 + r64() % 40) << 23)); float f; memcpy(&f, &b, 4); return f; } if (k == 0) return ((int)(r64() % 20001) - 10000) / 1000.0f; if (k == 1) return ldexpf(1.0f, (int)(r64() % 40) - 20) * ((r64() & 1) ? -1 : 1); if (k == 2) return (r64() % 5 == 0) ? 0.0f : ((int)(r64() % 7) - 3) * 0.25f; return (float)((double)(int64_t)(r64() >> 40) / 8388608.0) * ((r64() & 1) ? -1 : 1); }
 
 static std::vector<float> run(ggml_backend_t be, int K, int N, int M, const std::vector<uint8_t> & wq, const std::vector<float> & x) {
     ggml_init_params ip = { 16 * 1024 * 1024, nullptr, true };
@@ -35,7 +35,81 @@ static std::vector<float> run(ggml_backend_t be, int K, int N, int M, const std:
     return out;
 }
 
+// generic op gate: build a one-op graph on both backends and compare bit for bit
+static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, int variant, int trials) {
+    long bad = 0, total = 0;
+    for (int t = 0; t < trials; t++) {
+        std::vector<float> outs[2];
+        for (int be = 0; be < 2; be++) {
+            ggml_init_params ip = { 64 * 1024 * 1024, nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            const int ne0 = 32 * (1 + (t % 24)), ne1 = 1 + (t % 7), ne2 = 1 + (t % 3);
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+            ggml_tensor * y = nullptr; ggml_tensor * w = nullptr; ggml_tensor * m = nullptr; ggml_tensor * pos = nullptr; ggml_tensor * g = nullptr;
+            rng = 0xABCDEF1234567ull + t;                       // same data on both backends
+            std::vector<float> xv((size_t) ne0 * ne1 * ne2); for (auto & v : xv) v = rf();
+            if (variant == 0) { y = ggml_rms_norm(ctx, x, 1e-5f); }
+            if (variant == 1) { w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0); y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w); }
+            if (variant == 2) { m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, ne1); y = ggml_soft_max_ext(ctx, x, m, 0.125f, 0.0f); }
+            if (variant == 3) { y = ggml_soft_max_ext(ctx, x, nullptr, 1.0f, 0.0f); }
+            if (variant == 4 || variant == 5) { pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne2); y = ggml_rope_ext(ctx, x, pos, nullptr, ne0 / 2 * 2 > 64 ? 64 : ne0 / 2 * 2, variant == 5 ? GGML_ROPE_TYPE_NEOX : 0, 4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f); }
+            if (variant == 6) { g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2); y = ggml_swiglu_split(ctx, x, g); }
+            if (variant == 7) { y = ggml_silu(ctx, x); }
+            if (variant == 8) { y = ggml_gelu(ctx, x); }
+            if (variant == 9 || variant == 10) {
+                // MUL_MAT(f16 W [K x N x H], f32 X [K x M x H*r]); variant 10 = permuted (non-contiguous) src1 rows + transposed-view src0
+                const int K = 16 * (1 + (t % 12)) + (t % 3), N = 1 + (t % 9), H = 1 + (t % 2), M = ne1, r = 1 + (t % 2);
+                ggml_tensor * w16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, N, H);
+                std::vector<uint16_t> wv((size_t) K * N * H); for (auto & v : wv) v = ggml_fp32_to_fp16(rf());
+                ggml_tensor * xs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, M, H * r);
+                ggml_tensor * xin = xs;
+                if (variant == 10) { xin = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, H * r, M); xs = ggml_permute(ctx, xin, 0, 2, 1, 3); }
+                y = ggml_mul_mat(ctx, w16, xs);
+                ggml_backend_buffer_t bufm = ggml_backend_alloc_ctx_tensors(ctx, be == 0 ? cpu : gpu);
+                ggml_backend_tensor_set(w16, wv.data(), 0, wv.size() * 2);
+                std::vector<float> xv2((size_t) K * M * H * r); for (auto & v : xv2) v = rf();
+                ggml_backend_tensor_set(xin, xv2.data(), 0, xv2.size() * 4);
+                ggml_cgraph * gfm = ggml_new_graph(ctx); ggml_build_forward_expand(gfm, y);
+                ggml_backend_graph_compute(be == 0 ? cpu : gpu, gfm);
+                outs[be].resize(ggml_nelements(y)); ggml_backend_tensor_get(y, outs[be].data(), 0, outs[be].size() * 4);
+                ggml_backend_buffer_free(bufm); ggml_free(ctx);
+                continue;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be == 0 ? cpu : gpu);
+            ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * 4);
+            if (w) { std::vector<float> wv(ne0); for (auto & v : wv) v = rf(); ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * 4); }
+            if (g) { std::vector<float> gv(xv.size()); for (auto & v : gv) v = rf(); ggml_backend_tensor_set(g, gv.data(), 0, gv.size() * 4); }
+            if (m) { std::vector<uint16_t> mv((size_t) ne0 * ne1); for (size_t i = 0; i < mv.size(); i++) { float f = (r64() % 5 == 0) ? -INFINITY : ((int)(r64() % 9) - 4) * 0.5f; mv[i] = ggml_fp32_to_fp16(f); } ggml_backend_tensor_set(m, mv.data(), 0, mv.size() * 2); }
+            if (pos) { std::vector<int32_t> pv(ne2); for (int i = 0; i < ne2; i++) pv[i] = (int) (r64() % 4096); ggml_backend_tensor_set(pos, pv.data(), 0, pv.size() * 4); }
+            ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, y);
+            ggml_backend_graph_compute(be == 0 ? cpu : gpu, gf);
+            outs[be].resize(ggml_nelements(y)); ggml_backend_tensor_get(y, outs[be].data(), 0, outs[be].size() * 4);
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+        }
+        long nb = 0; for (size_t i = 0; i < outs[0].size(); i++) { uint32_t ua, ub; memcpy(&ua, &outs[0][i], 4); memcpy(&ub, &outs[1][i], 4); if (ua != ub) nb++; }
+        if (nb && bad == 0) {
+            size_t fi = 0; for (size_t i = 0; i < outs[0].size(); i++) { uint32_t ua, ub; memcpy(&ua, &outs[0][i], 4); memcpy(&ub, &outs[1][i], 4); if (ua != ub) { fi = i; break; } }
+            uint32_t ua, ub; memcpy(&ua, &outs[0][fi], 4); memcpy(&ub, &outs[1][fi], 4);
+            printf("  %s trial %d: first mismatch idx=%zu cpu=%08x (%a) gpu=%08x (%a) (n=%zu, %ld differ)\n", label, t, fi, ua, outs[0][fi], ub, outs[1][fi], outs[0].size(), nb);
+        }
+        bad += nb; total += outs[0].size();
+    }
+    printf("OP GATE %-14s %ld/%ld mismatches -> %s\n", label, bad, total, bad ? "FAIL" : "PASS");
+    return bad;
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "ops") == 0) {
+        ggml_backend_load_all();
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        const int trials = argc > 2 ? atoi(argv[2]) : 24;
+        long bad = 0;
+        const char * names[11] = { "rms_norm", "rms_norm+mul", "soft_max f16m", "soft_max plain", "rope norm", "rope neox", "swiglu", "silu", "gelu", "mul_mat f16", "mul_mat f16 perm" };
+        for (int v = 0; v < 11; v++) bad += gate_op(cpu, gpu, names[v], v, trials);
+        printf("ALL OP GATES: %s\n", bad ? "FAIL" : "PASS");
+        return bad ? 1 : 0;
+    }
     const int trials = argc > 1 ? atoi(argv[1]) : 20;
     ggml_backend_load_all();
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

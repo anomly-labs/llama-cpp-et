@@ -27,8 +27,6 @@ out = r'''// Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bru
 #include "det_soft.h"
 
 #ifdef __METAL_VERSION__
-#define DSO_FSQRT(a)   metal::precise::sqrt(a)
-#define DSO_FDIV(a, b) metal::precise::divide((a), (b))
 #define DSO_F2B(x) as_type<uint>(x)
 #define DSO_B2F(b) as_type<float>(b)
 #define DSO_CONST constant
@@ -36,12 +34,104 @@ out = r'''// Copyright (c) 2026 Anomly, Inc. All rights reserved. Author: Ry Bru
 #else
 #include <string.h>
 #include <math.h>
-#define DSO_FSQRT(a)   sqrtf(a)
-#define DSO_FDIV(a, b) ((a) / (b))
 DS_FN ds_u32 DSO_F2B(float x) { ds_u32 b; memcpy(&b, &x, 4); return b; }
 DS_FN float  DSO_B2F(ds_u32 b) { float x; memcpy(&x, &b, 4); return x; }
 #define DSO_CONST static const
 #define DSO_TAB(T) const T *
+#endif
+
+// ---- software binary32 ops (IEEE RNE incl. subnormals, inf, nan) on the software double ----
+// Apple GPUs flush single-precision subnormals to zero (measured on the M4 Pro with
+// MTLMathModeSafe and fp contract off), so on Metal every float op of the exact profile goes
+// through these; the double has >= 2*24+2 bits, so one double op + one rounding is the correctly
+// rounded float op (Figueroa). On the host they are only compiled for the gate (test_det_ops.c).
+#define DSO_QNAN 0x7FC00000u
+DS_FN int dso_f_is_nan(ds_u32 b) { return ((b & 0x7F800000u) == 0x7F800000u) && (b & 0x7FFFFFu); }
+DS_FN int dso_f_is_inf(ds_u32 b) { return (b & 0x7FFFFFFFu) == 0x7F800000u; }
+DS_FN int dso_f_is_zero(ds_u32 b) { return (b & 0x7FFFFFFFu) == 0u; }
+DS_FN ds_u32 dso_fmul_bits(ds_u32 a, ds_u32 b) {
+    const ds_u32 s = (a ^ b) & 0x80000000u;
+    if (dso_f_is_nan(a) || dso_f_is_nan(b)) return DSO_QNAN;
+    if (dso_f_is_inf(a) || dso_f_is_inf(b)) return (dso_f_is_zero(a) || dso_f_is_zero(b)) ? DSO_QNAN : (s | 0x7F800000u);
+    return ds_to_f32bits(ds_mul(ds_from_f32bits(a), ds_from_f32bits(b)));
+}
+DS_FN ds_u32 dso_fadd_bits(ds_u32 a, ds_u32 b) {
+    if (dso_f_is_nan(a) || dso_f_is_nan(b)) return DSO_QNAN;
+    if (dso_f_is_inf(a)) return (dso_f_is_inf(b) && (a != b)) ? DSO_QNAN : a;
+    if (dso_f_is_inf(b)) return b;
+    if (dso_f_is_zero(a) && dso_f_is_zero(b)) return (a == b) ? a : 0u;   // (+0)+(-0) = +0 in RNE
+    return ds_to_f32bits(ds_add(ds_from_f32bits(a), ds_from_f32bits(b)));
+}
+DS_FN ds_u32 dso_fsub_bits(ds_u32 a, ds_u32 b) { return dso_fadd_bits(a, b ^ 0x80000000u); }
+DS_FN ds_u32 dso_fdiv_bits(ds_u32 a, ds_u32 b) {
+    const ds_u32 s = (a ^ b) & 0x80000000u;
+    if (dso_f_is_nan(a) || dso_f_is_nan(b)) return DSO_QNAN;
+    if (dso_f_is_inf(a)) return dso_f_is_inf(b) ? DSO_QNAN : (s | 0x7F800000u);
+    if (dso_f_is_inf(b)) return s;
+    if (dso_f_is_zero(b)) return dso_f_is_zero(a) ? DSO_QNAN : (s | 0x7F800000u);
+    if (dso_f_is_zero(a)) return s;
+    return ds_to_f32bits(ds_div(ds_from_f32bits(a), ds_from_f32bits(b)));
+}
+// sqrt: integer square root of the significand with 27+ result bits and a sticky remainder;
+// never a tie (an exact 25-bit odd root would need an odd radicand of 49+ bits)
+DS_FN ds_u32 dso_fsqrt_bits(ds_u32 a) {
+    if (dso_f_is_nan(a)) return DSO_QNAN;
+    if (dso_f_is_zero(a)) return a;
+    if (a & 0x80000000u) return DSO_QNAN;
+    if (dso_f_is_inf(a)) return a;
+    ds_i32 e = (ds_i32) ((a >> 23) & 0xFF); ds_u64 m = a & 0x7FFFFFu;
+    if (e == 0) { e = 1; while (!(m & 0x800000u)) { m <<= 1; e--; } } else { m |= 0x800000u; }
+    ds_i32 e2 = e - 127 - 23;                       // value = m * 2^e2
+    if (e2 & 1) { m <<= 1; e2--; }                   // even exponent
+    const ds_u64 N = m << 30;                        // root has 27 or 28 bits
+    ds_u64 q = 0, r = 0;
+    for (ds_i32 i = 31; i >= 0; i--) {               // restoring integer sqrt, 2 radicand bits per step
+        r = (r << 2) | ((N >> (2 * i)) & 3u);
+        const ds_u64 t = (q << 2) | 1u;
+        q <<= 1;
+        if (r >= t) { r -= t; q |= 1u; }
+    }
+    // q = floor(sqrt(N)), sticky = r != 0; result = q * 2^(e2/2 - 15)
+    ds_i32 qb = 64 - DS_CLZ64(q);                    // 27 or 28
+    const ds_i32 sh = qb - 24;
+    ds_u64 mant = q >> sh;
+    const ds_u64 rem = q & ((1ull << sh) - 1), hmid = 1ull << (sh - 1);
+    if (rem > hmid || (rem == hmid && (r != 0 || (mant & 1u)))) { mant++; if (mant == (1ull << 24)) { mant >>= 1; qb++; } }
+    const ds_i32 ef = (e2 / 2 - 15) + (qb - 24) + 23 + 127;   // biased float exponent of mant * 2^(...)
+    return (ds_u32) (((ds_u32) ef << 23) | (ds_u32) (mant & 0x7FFFFFu));
+}
+// MAX(a, b) = (a > b) ? a : b on the total order of the bits (+0 > -0; both give the same softmax)
+DS_FN ds_u32 dso_fkey(ds_u32 b) { return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
+DS_FN ds_u32 dso_funkey(ds_u32 k) { return (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k; }   // inverse of dso_fkey
+DS_FN ds_u32 dso_fmax_bits(ds_u32 a, ds_u32 b) { return dso_fkey(a) > dso_fkey(b) ? a : b; }
+// binary16 bits -> binary32 bits, exact (subnormal halves normalised in integers)
+DS_FN ds_u32 dso_f16_to_f32bits(ds_u32 h) {
+    const ds_u32 s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu; ds_u32 f = h & 0x3FFu;
+    if (e == 0) {
+        if (f == 0) return s << 31;
+        ds_u32 ee = 1; while (!(f & 0x400u)) { f <<= 1; ee--; }
+        return (s << 31) | ((ee + 112u) << 23) | ((f & 0x3FFu) << 13);
+    }
+    if (e == 31) return (s << 31) | 0x7F800000u | (f << 13);
+    return (s << 31) | ((e + 112u) << 23) | (f << 13);
+}
+#ifdef __METAL_VERSION__
+DS_FN float dso_fmul(float a, float b) { return DSO_B2F(dso_fmul_bits(DSO_F2B(a), DSO_F2B(b))); }
+DS_FN float dso_fadd(float a, float b) { return DSO_B2F(dso_fadd_bits(DSO_F2B(a), DSO_F2B(b))); }
+DS_FN float dso_fsub(float a, float b) { return DSO_B2F(dso_fsub_bits(DSO_F2B(a), DSO_F2B(b))); }
+DS_FN float dso_fdiv(float a, float b) { return DSO_B2F(dso_fdiv_bits(DSO_F2B(a), DSO_F2B(b))); }
+DS_FN float dso_fsqrt(float a)         { return DSO_B2F(dso_fsqrt_bits(DSO_F2B(a))); }
+#define DSO_FMUL(a, b) dso_fmul((a), (b))
+#define DSO_FADD(a, b) dso_fadd((a), (b))
+#define DSO_FSUB(a, b) dso_fsub((a), (b))
+#define DSO_FDIV(a, b) dso_fdiv((a), (b))
+#define DSO_FSQRT(a)   dso_fsqrt(a)
+#else
+#define DSO_FMUL(a, b) ((a) * (b))
+#define DSO_FADD(a, b) ((a) + (b))
+#define DSO_FSUB(a, b) ((a) - (b))
+#define DSO_FDIV(a, b) ((a) / (b))
+#define DSO_FSQRT(a)   sqrtf(a)
 #endif
 
 // double constants (bit patterns)
@@ -63,6 +153,12 @@ DS_FN float  DSO_B2F(ds_u32 b) { float x; memcpy(&x, &b, 4); return x; }
 #define DSO_M_TWENTY __M_TWENTY__
 #define DSO_INF 0x7FF0000000000000ull
 
+// coefficient tables at program scope (MSL forbids address-space-qualified automatics)
+DSO_CONST ds_u64 dso_expc[14] = { __EXPC__ };
+DSO_CONST ds_u64 dso_invk[15] = { __INVK__ };            // 1/1, 1/3, ..., 1/29 as the reference divides them
+DSO_CONST ds_u64 dso_sc[8] = { __SC__ };
+DSO_CONST ds_u64 dso_cc[9] = { __CC__ };
+
 // det_ldexp, mirrored literally (two-step scaling for large |k|)
 DS_FN ds_u64 dso_ldexp(ds_u64 x, ds_i32 k) {
     if (k > 1023) {
@@ -77,9 +173,8 @@ DS_FN ds_u64 dso_ldexp(ds_u64 x, ds_i32 k) {
 
 // e^r for |r| <= 0.36: Taylor to r^13
 DS_FN ds_u64 dso_exp_small(ds_u64 r) {
-    DSO_CONST ds_u64 c[14] = { __EXPC__ };
-    ds_u64 p = c[13];
-    for (int i = 12; i >= 0; i--) p = ds_add(ds_mul(p, r), c[i]);
+    ds_u64 p = dso_expc[13];
+    for (int i = 12; i >= 0; i--) p = ds_add(ds_mul(p, r), dso_expc[i]);
     return p;
 }
 DS_FN ds_u64 dso_exp_d(ds_u64 x) {
@@ -101,29 +196,26 @@ DS_FN ds_u64 dso_exp2_d(ds_u64 y) {
 }
 // log2(x), finite normal x > 0
 DS_FN ds_u64 dso_log2_d(ds_u64 x) {
-    DSO_CONST ds_u64 invk[15] = { __INVK__ };            // 1/1, 1/3, ..., 1/29 as the reference divides them
     ds_i32 e = (ds_i32) ((x >> 52) & 0x7FF) - 1023;
     ds_u64 m = (x & 0xFFFFFFFFFFFFFull) | (1023ull << 52);
     if (ds_lt(DSO_SQRT1_2, m) && !ds_eq(DSO_SQRT1_2, m)) { m = ds_mul(m, DSO_HALF); e++; }   // m > sqrt(2)
     const ds_u64 s  = ds_div(ds_sub(m, DSO_ONE), ds_add(m, DSO_ONE));
     const ds_u64 s2 = ds_mul(s, s);
     ds_u64 p = DSO_ZERO;
-    for (int k = 29; k >= 1; k -= 2) p = ds_add(ds_mul(p, s2), invk[(k - 1) / 2]);
+    for (int k = 29; k >= 1; k -= 2) p = ds_add(ds_mul(p, s2), dso_invk[(k - 1) / 2]);
     const ds_u64 ln_m = ds_mul(DSO_TWO, ds_mul(s, p));
     return ds_add(ds_from_i64(e), ds_mul(ln_m, DSO_INV_LN2));
 }
 // sin/cos after Cody-Waite reduction, Taylor
 DS_FN void dso_sincos_d(ds_u64 x, DS_PTR(ds_u64) s, DS_PTR(ds_u64) c) {
-    DSO_CONST ds_u64 sc[8] = { __SC__ };
-    DSO_CONST ds_u64 cc[9] = { __CC__ };
     const ds_u64 n  = ds_floor(ds_add(ds_mul(x, DSO_TWO_OVER_PI), DSO_HALF));
     const ds_u64 r  = ds_sub(ds_sub(ds_sub(x, ds_mul(n, DSO_PIO2_1)), ds_mul(n, DSO_PIO2_2)), ds_mul(n, DSO_PIO2_3));
     const ds_u64 r2 = ds_mul(r, r);
-    ds_u64 ps = sc[7];
-    for (int i = 6; i >= 0; i--) ps = ds_add(ds_mul(ps, r2), sc[i]);
+    ds_u64 ps = dso_sc[7];
+    for (int i = 6; i >= 0; i--) ps = ds_add(ds_mul(ps, r2), dso_sc[i]);
     ps = ds_mul(ps, r);
-    ds_u64 pc = cc[8];
-    for (int i = 7; i >= 0; i--) pc = ds_add(ds_mul(pc, r2), cc[i]);
+    ds_u64 pc = dso_cc[8];
+    for (int i = 7; i >= 0; i--) pc = ds_add(ds_mul(pc, r2), dso_cc[i]);
     const ds_i64 q = ds_to_i64_trunc(n) & 3;
     switch (q) {
         case 0: *s = ps;          *c = pc;          break;
@@ -164,11 +256,11 @@ DS_FN ds_u32 dso_tanhf_bits(ds_u32 b) {
 #define DSO_GELU_COEF_A    0.044715f
 #define DSO_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
 DS_FN float dso_geluf(float x) {
-    const float inner = DSO_SQRT_2_OVER_PI * (x * (1.0f + (DSO_GELU_COEF_A * (x * x))));
-    return (0.5f * x) * (1.0f + DSO_B2F(dso_tanhf_bits(DSO_F2B(inner))));
+    const float inner = DSO_FMUL(DSO_SQRT_2_OVER_PI, DSO_FMUL(x, DSO_FADD(1.0f, DSO_FMUL(DSO_GELU_COEF_A, DSO_FMUL(x, x)))));
+    return DSO_FMUL(DSO_FMUL(0.5f, x), DSO_FADD(1.0f, DSO_B2F(dso_tanhf_bits(DSO_F2B(inner)))));
 }
-DS_FN float dso_sigmoidf(float x) { return DSO_FDIV(1.0f, 1.0f + DSO_B2F(dso_expf_bits(DSO_F2B(-x)))); }
-DS_FN float dso_siluf(float x)    { return x * dso_sigmoidf(x); }
+DS_FN float dso_sigmoidf(float x) { return DSO_FDIV(1.0f, DSO_FADD(1.0f, DSO_B2F(dso_expf_bits(DSO_F2B(-x))))); }
+DS_FN float dso_siluf(float x)    { return DSO_FMUL(x, dso_sigmoidf(x)); }
 
 // ---- exact big accumulator (640-bit, radix 352): integer, shared with bp8_exact_soft's rule ----
 #define DSO_BIG_LIMBS 20
@@ -228,7 +320,7 @@ DS_FN ds_u64 dso_big_to_double(BP8_CPTR_(ds_u32) acc) {
 // RMSNorm scale: mean = (float)(S/n); scale = 1/sqrtf(mean + eps)
 DS_FN float dso_rms_scale(ds_u64 sumsq, ds_i32 n, float eps) {
     const float mean = DSO_B2F(ds_to_f32bits(ds_div(sumsq, ds_from_i64(n))));
-    return DSO_FDIV(1.0f, DSO_FSQRT(mean + eps));
+    return DSO_FDIV(1.0f, DSO_FSQRT(DSO_FADD(mean, eps)));
 }
 DS_FN float dso_soft_max_inv(ds_u64 sum) { return DSO_FDIV(1.0f, DSO_B2F(ds_to_f32bits(sum))); }
 #endif

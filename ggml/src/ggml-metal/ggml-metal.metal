@@ -17,7 +17,10 @@ __embed_ggml-common.h__
 
 using namespace metal;
 
-#include "ggml-metal-bposit8.h"   // Anomly exact b-posit8 kernels (inlined by the embedder)
+#ifdef ANOMLY_METAL_EXACT
+#pragma METAL fp contract(off)
+#endif
+#include "ggml-metal-bposit8.h"   // Anomly exact-profile kernels (inlined by the embedder)
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -1110,7 +1113,11 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
+#ifdef ANOMLY_METAL_EXACT
+            dst_ptr[i0] = (T) dso_gelu_v(x);
+#else
             dst_ptr[i0] = (T) (0.5*x*(1 + precise::tanh(SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x))));
+#endif
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU_ERF) {
@@ -1122,7 +1129,11 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SILU) {
+#ifdef ANOMLY_METAL_EXACT
+            dst_ptr[i0] = (T) dso_silu_v(x);
+#else
             dst_ptr[i0] = (T) (x / (1 + exp(-x)));
+#endif
         }
 
         if (FC_OP == OP_UNARY_NUM_ELU) {

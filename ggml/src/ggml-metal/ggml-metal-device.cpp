@@ -332,6 +332,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
     };
 
     snprintf(base, 256, "kernel_%s_%s", op_str, ggml_type_name(op->src[0]->type));
+#ifdef ANOMLY_METAL_EXACT
+    if (ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU) {
+        snprintf(base, 256, "kernel_swiglu_f32_exact");
+    }
+#endif
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -473,6 +478,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
 
     const ggml_type tsrc1 = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
 
+#ifdef ANOMLY_METAL_EXACT
+    suffix = "_exact";
+#endif
     snprintf(base, 256, "kernel_soft_max_%s%s", ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s", base);
 
@@ -482,6 +490,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
     }
 
     res.smem = 32*sizeof(float);
+#ifdef ANOMLY_METAL_EXACT
+    res.smem = 32*20*sizeof(uint64_t) + 33*sizeof(float) + 32;   // limb sums + per-simdgroup max + inv
+#endif
 
     return res;
 }
@@ -1694,6 +1705,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
                 default: GGML_ABORT("fatal error");
             } break;
         case GGML_OP_RMS_NORM:
+#ifdef ANOMLY_METAL_EXACT
+            suffix = "_exact";   // exact profile: scalar exact kernels, threadgroup reduction buffer below
+#endif
             switch (n_fuse) {
                 case 1: snprintf(base, 256, "kernel_rms_norm_f32%s", suffix);         break;
                 case 2: snprintf(base, 256, "kernel_rms_norm_mul_f32%s", suffix);     break;
@@ -1711,6 +1725,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
     }
 
     res.smem = 32*sizeof(float);
+#ifdef ANOMLY_METAL_EXACT
+    if (op->op == GGML_OP_RMS_NORM) {
+        res.smem = 32*20*sizeof(uint64_t) + 256;  // per-simdgroup 20-limb sums + scale + finite flags
+    }
+#endif
 
     return res;
 }
@@ -1742,6 +1761,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_
         snprintf(base, 256, "kernel_rope_norm_%s", ggml_type_name(op->src[0]->type));
     }
 
+#ifdef ANOMLY_METAL_EXACT
+    // exact profile: f32 norm/neox forward only (supports_op enforces); no function constants
+    snprintf(base, 256, "kernel_rope_%s_f32_exact", is_neox ? "neox" : "norm");
+    snprintf(name, 256, "%s", base);
+    {
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        }
+        return res;
+    }
+#endif
     snprintf(name, 256, "%s_imrope=%d_is_back=%d", base, is_imrope ? 1 : 0, is_back ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

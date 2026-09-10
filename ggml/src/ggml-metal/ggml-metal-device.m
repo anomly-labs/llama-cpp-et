@@ -224,6 +224,9 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 #if GGML_METAL_EMBED_LIBRARY
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
+#ifdef ANOMLY_METAL_EXACT
+                [prep setObject:@"1" forKey:@"ANOMLY_METAL_EXACT"];
+#endif
 
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
@@ -1061,13 +1064,35 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     // exact profile (Anomly): these ops have exact, order-independent CPU implementations in this
     // fork (ggml-det); the Metal versions do not, so they are declined and fall back to the CPU.
     switch (op->op) {
-        case GGML_OP_RMS_NORM: case GGML_OP_NORM: case GGML_OP_GROUP_NORM: case GGML_OP_L2_NORM:
-        case GGML_OP_SOFT_MAX: case GGML_OP_ROPE: case GGML_OP_ROPE_BACK:
-        case GGML_OP_UNARY: case GGML_OP_GLU:
+        case GGML_OP_NORM: case GGML_OP_GROUP_NORM: case GGML_OP_L2_NORM: case GGML_OP_ROPE_BACK:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_SUM: case GGML_OP_SUM_ROWS: case GGML_OP_MEAN: case GGML_OP_CUMSUM:
         case GGML_OP_DIV: case GGML_OP_SQRT: case GGML_OP_LOG: case GGML_OP_SQR:
             return false;
+        case GGML_OP_RMS_NORM:   // exact kernel: f32, contiguous rows
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(op->src[0])) return false;
+            break;
+        case GGML_OP_SOFT_MAX: { // exact kernel: f32 rows, f16/f32 mask, no ALiBi
+            float max_bias; memcpy(&max_bias, ((const float *) op->op_params) + 1, sizeof(float));
+            if (op->src[0]->type != GGML_TYPE_F32 || max_bias != 0.0f) return false;
+            if (op->src[1] && op->src[1]->type != GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_F32) return false;
+            if (op->src[2] && op->src[2]->type != GGML_TYPE_F32) return false;
+            break; }
+        case GGML_OP_ROPE: {     // exact kernel: f32, norm or neox, no YaRN
+            const int mode = ((const int32_t *) op->op_params)[2];
+            float ext_factor; memcpy(&ext_factor, ((const int32_t *) op->op_params) + 7, sizeof(float));
+            const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+            const bool plain = (mode == 0) || (mode == GGML_ROPE_TYPE_NEOX);
+            if (op->src[0]->type != GGML_TYPE_F32 || !plain || ext_factor != 0.0f) return false;
+            (void) is_neox;
+            break; }
+        case GGML_OP_UNARY:      // exact kernels: SiLU and tanh-GELU on f32
+            if (op->src[0]->type != GGML_TYPE_F32) return false;
+            if (ggml_get_unary_op(op) != GGML_UNARY_OP_SILU && ggml_get_unary_op(op) != GGML_UNARY_OP_GELU) return false;
+            break;
+        case GGML_OP_GLU:        // exact kernel: SwiGLU on f32
+            if (op->src[0]->type != GGML_TYPE_F32 || ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
+            break;
         default: break;
     }
 #endif
@@ -1302,6 +1327,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[0]->type == GGML_TYPE_BPOSIT8) {
                 return has_simdgroup_reduction && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                        op->src[0]->ne[0] % 32 == 0 && op->src[0]->nb[0] == 33 && op->src[1]->nb[0] == sizeof(float);
+            }
+            if (op->src[0]->type == GGML_TYPE_F16) {   // exact f16 kernel (attention KQ / KQV)
+                return has_simdgroup_reduction && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                       op->src[0]->nb[0] == sizeof(ggml_fp16_t) && op->src[1]->nb[0] == sizeof(float);
             }
             return false;
 #endif

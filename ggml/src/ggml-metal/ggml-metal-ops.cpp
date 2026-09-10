@@ -2049,11 +2049,102 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
 // CPU and CUDA kernels.
 // ---------------------------------------------------------------------------------------------
 size_t ggml_metal_op_mul_mat_bposit8_extra_tmp(const ggml_tensor * op) {
-    if (op->op != GGML_OP_MUL_MAT || op->src[0]->type != GGML_TYPE_BPOSIT8) return 0;
+    if (op->op != GGML_OP_MUL_MAT) return 0;
     const ggml_tensor * s1 = op->src[1];
+#ifdef ANOMLY_METAL_EXACT
+    if (op->src[0]->type == GGML_TYPE_F16) {                  // exact f16 path: src1 converted to f16 behind dst
+        return GGML_PAD((size_t) ggml_nelements(s1) * sizeof(ggml_fp16_t), 16);
+    }
+#endif
+    if (op->src[0]->type != GGML_TYPE_BPOSIT8) return 0;
     const int64_t nblk_total = (s1->ne[0] / QK_BPOSIT8) * s1->ne[1] * s1->ne[2] * s1->ne[3];
     return GGML_PAD((size_t) nblk_total * sizeof(block_bposit8), 16);
 }
+
+#ifdef ANOMLY_METAL_EXACT
+// exact f16 matmul (attention KQ / KQV): src1 f32 -> f16 (RN-even) into scratch, then the exact
+// det_dot_f16 per output through the same 256-bit quire readout as the CPU (ggml-det)
+static int ggml_metal_op_mul_mat_f16_exact(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne10 == ne00);
+    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
+    GGML_ASSERT(nb10 == sizeof(float));
+    GGML_ASSERT(nb0  == sizeof(float));
+    GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+
+    const int64_t nel1 = (int64_t) ne10 * ne11 * ne12 * ne13;
+
+    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_buffer_id bid_tmp = bid_dst;                   // converted src1 lives behind dst
+    bid_tmp.offs += ggml_nbytes(op);
+
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_cvt_f32_f16_det");
+        ggml_metal_kargs_bp8_quant args = {
+            /*.nblk_row   =*/ ne10,
+            /*.ne1        =*/ ne11,
+            /*.ne2        =*/ ne12,
+            /*.s1         =*/ (int64_t) (nb11 / sizeof(float)),
+            /*.s2         =*/ (int64_t) (nb12 / sizeof(float)),
+            /*.s3         =*/ (int64_t) (nb13 / sizeof(float)),
+            /*.nblk_total =*/ nel1,
+        };
+        const int nth = 256;
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (nel1 + nth - 1) / nth, 1, 1, nth, 1, 1);
+    }
+    ggml_metal_encoder_memory_barrier(enc);
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_mul_mv_f16_exact");
+        const int nsg = 4;                                     // BP8_NSG in the shader
+        ggml_metal_kargs_bp8_mv args = {
+            /*.nblk =*/ (int32_t) ne00,
+            /*.ne01 =*/ ne01,
+            /*.ne12 =*/ ne12,
+            /*.s01  =*/ (int64_t) (nb01 / sizeof(ggml_fp16_t)),
+            /*.s02  =*/ (int64_t) (nb02 / sizeof(ggml_fp16_t)),
+            /*.s03  =*/ (int64_t) (nb03 / sizeof(ggml_fp16_t)),
+            /*.s11  =*/ ne10,
+            /*.s12  =*/ (int64_t) ne10 * ne11,
+            /*.s13  =*/ (int64_t) ne10 * ne11 * ne12,
+            /*.sd1  =*/ (int64_t) (nb1 / sizeof(float)),
+            /*.sd2  =*/ (int64_t) (nb2 / sizeof(float)),
+            /*.sd3  =*/ (int64_t) (nb3 / sizeof(float)),
+            /*.r2   =*/ (int32_t) (ne12 / ne02),
+            /*.r3   =*/ (int32_t) (ne13 / ne03),
+        };
+        const size_t smem = (size_t) nsg * 32 * 8 * sizeof(int64_t);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nsg - 1) / nsg, ne11, ne12 * ne13, 32, nsg, 1);
+    }
+    return 1;
+}
+#endif
 
 int ggml_metal_op_mul_mat_bposit8(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -2149,6 +2240,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     if (op->src[0]->type == GGML_TYPE_BPOSIT8) {
         return ggml_metal_op_mul_mat_bposit8(ctx, idx);
     }
+#ifdef ANOMLY_METAL_EXACT
+    if (op->src[0]->type == GGML_TYPE_F16) {
+        return ggml_metal_op_mul_mat_f16_exact(ctx, idx);
+    }
+#endif
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -3582,6 +3678,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
 
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     nth = std::min(nth, args.ne00_t);
+#ifdef ANOMLY_METAL_EXACT
+    if (op->op == GGML_OP_RMS_NORM) {
+        nth = std::min(((nth + 31) / 32) * 32, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));   // whole simdgroups for the limb reduction
+    }
+#endif
 
     const size_t smem = pipeline.smem;
 
