@@ -132,4 +132,66 @@ DS_FN ds_u32 ds_to_f32bits(ds_u64 a) {
     if ((q >> 23) == 0) return (ds_u32)((s << 31) | (ds_u32)q);   // subnormal float (or zero)
     return (ds_u32)((s << 31) | ((ds_u32)fe << 23) | ((ds_u32)q & 0x7FFFFFu));
 }
+
+// ---- multiply, divide, floor, integer conversions (for the norm / softmax / rope ports) ----
+#ifdef __METAL_VERSION__
+#define DS_MULHI64(a, b) ((ds_u64)metal::mulhi((ulong)(a), (ulong)(b)))
+#else
+#define DS_MULHI64(a, b) ((ds_u64)(((unsigned __int128)(a) * (unsigned __int128)(b)) >> 64))
+#endif
+// a * b, finite inputs, IEEE RNE
+DS_FN ds_u64 ds_mul(ds_u64 a, ds_u64 b) {
+    ds_u64 ma, mb; ds_i32 ea, eb;
+    ds_unpack(a, &ma, &ea); ds_unpack(b, &mb, &eb);
+    const ds_u64 s = ds_sign(a) ^ ds_sign(b);
+    if (ma == 0 || mb == 0) return s << 63;
+    ds_i32 la = DS_CLZ64(ma) - 11, lb = DS_CLZ64(mb) - 11;     // subnormal significands -> 53 bits
+    if (la > 0) { ma <<= la; ea -= la; }
+    if (lb > 0) { mb <<= lb; eb -= lb; }
+    const ds_u64 lo = ma * mb, hi = DS_MULHI64(ma, mb);       // 106-bit product, leading bit 104 or 105
+    const ds_i32 top = 127 - DS_CLZ64(hi);
+    const ds_i32 sh = top - 62;                                 // 42 or 43: leading bit -> 62
+    ds_u64 mant = (hi << (64 - sh)) | (lo >> sh);
+    const ds_u64 lost = lo & ((1ull << sh) - 1);
+    mant |= (lost ? 1ull : 0ull);
+    return ds_round_pack(s, (ds_i64) ea + eb + sh - 1065, mant);
+}
+// a / b, finite, b != 0, IEEE RNE (restoring division, 62 quotient bits + sticky)
+DS_FN ds_u64 ds_div(ds_u64 a, ds_u64 b) {
+    ds_u64 ma, mb; ds_i32 ea, eb;
+    ds_unpack(a, &ma, &ea); ds_unpack(b, &mb, &eb);
+    const ds_u64 s = ds_sign(a) ^ ds_sign(b);
+    if (ma == 0) return s << 63;
+    ds_i32 la = DS_CLZ64(ma) - 11, lb = DS_CLZ64(mb) - 11;
+    if (la > 0) { ma <<= la; ea -= la; }
+    if (lb > 0) { mb <<= lb; eb -= lb; }
+    ds_u64 rem, q;                                              // integer part first so rem < mb
+    if (ma >= mb) { rem = ma - mb; q = 1; } else { rem = ma; q = 0; }
+    for (int i = 0; i < 62; i++) { rem <<= 1; q <<= 1; if (rem >= mb) { rem -= mb; q |= 1ull; } }
+    q |= (rem ? 1ull : 0ull);                                   // sticky; q = floor(ma*2^62/mb) < 2^63
+    return ds_round_pack(s, (ds_i64) ea - eb + 1023, q);
+}
+// any int64 -> double (RNE)
+DS_FN ds_u64 ds_from_i64(ds_i64 v) {
+    if (v == 0) return 0;
+    const ds_u64 s = v < 0; const ds_u64 m = s ? (ds_u64) (-(v + 1)) + 1ull : (ds_u64) v;
+    return ds_round_pack(s, 1085, m);                           // value = m * 2^(e - 1085)
+}
+// truncate toward zero to int64 (|x| < 2^63)
+DS_FN ds_i64 ds_to_i64_trunc(ds_u64 a) {
+    ds_u64 m; ds_i32 e; ds_unpack(a, &m, &e);
+    if (m == 0) return 0;
+    const ds_i32 k = e - 1075;                                  // value = m * 2^k
+    ds_u64 mag;
+    if (k >= 0) mag = (k >= 64) ? 0 : (m << k);
+    else mag = (k <= -64) ? 0 : (m >> (-k));
+    return ds_sign(a) ? -(ds_i64) mag : (ds_i64) mag;
+}
+// floor for |x| < 2^62, the reference's way: truncate toward zero, then correct
+DS_FN ds_u64 ds_floor(ds_u64 a) {
+    const ds_i64 t = ds_to_i64_trunc(a);
+    ds_u64 r = ds_from_i64(t);
+    if (ds_lt(a, r)) r = ds_from_i64(t - 1);
+    return r;
+}
 #endif
