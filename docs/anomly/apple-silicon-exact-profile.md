@@ -61,8 +61,10 @@ exact-profile kernels use no floating-point hardware at all for anything that to
 - **ADD / SUB / MUL / DIV (residuals, biases, broadcasts, the fused ADD chain) and SCALE without
   bias**: the same indexing and fusion as the upstream kernels, arithmetic on the software
   binary32. The upstream hardware kernels flush subnormal results — measured: an ADD whose exact
-  result is 0x1.2a4028p-126 returned 0 — so they are not used. `get_rows` of quantised tensors and
-  SCALE with a bias (the CPU uses an FMA there) stay on the CPU.
+  result is 0x1.2a4028p-126 returned 0 — so they are not used.
+- **get_rows of b-posit8** (the embedding lookup): the CPU dequantiser's single rounding on the
+  software double. With it, nothing in these four graphs runs on the CPU. SCALE with a bias (the
+  CPU uses an FMA there) and the ops without an exact kernel are still declined to the CPU.
 - The shader library is compiled with fast-math off. `ANOMLY_METAL_EXACT` is the only way Metal
   is allowed on in this fork; ops without an exact kernel are declined by `supports_op`.
 
@@ -75,7 +77,8 @@ Gates, all on the M4 Pro:
   against the CPU backend, random shapes, a subnormal-heavy input stream: rms_norm (+mul),
   soft_max (f16 mask, plain), rope (norm, neox), swiglu, silu, gelu, mul_mat f16 (contiguous,
   permuted), add (+scale, ×3 fused, row broadcast), sub, mul (ne0 broadcast), div, scale, cpy
-  f32→f16(→f32), set_rows f32→f16: **all 0 mismatches**; the b-posit8 matmul gate 0 / 8,288.
+  f32→f16(→f32), set_rows f32→f16, get_rows b-posit8: **all 0 mismatches**; the b-posit8 matmul
+  gate 0 / 8,288.
 - Whole-graph dumps (`INVAR_LOGITS_OUT`, layer-1 matmuls, logits, tokens) with `-ngl 99` against
   the x86 dumps, compared tensor-by-tensor and as `LC_ALL=C sort | sha256sum` (the Metal graph
   optimizer schedules Qcur_rope/Kcur_rope after Vcur, so the raw line order differs; nothing
