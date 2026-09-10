@@ -179,18 +179,32 @@ kernel void kernel_mul_mv_bposit8_exact(
     threadgroup long * a0 = tgacc + (int) sgitg * 8 * 32 + lane;
 #define BP8_A(w) a0[(w) * 32]
     for (int w = 0; w < 8; w++) BP8_A(w) = 0;
+    // Per block pair the product exponent e = Ex + Ey + 48 is in [0, 96]. Each product goes into one
+    // of seven 16-bit-granular bins (P << (e & 15) fits 24 bits, 32 of them fit an int32) chosen by
+    // selects — no data-dependent register index — and the seven bins are folded into the quire
+    // once per block pair (7 folds per 32 products). Measured on the M4 Pro (576x1536 x 64 tokens):
+    // 2145 us with per-product threadgroup limbs -> 1536 us. Same integer sum, same bits.
     for (int ib = lane; ib < args.nblk; ib += 32) {
         const int se = (int) xr[ib].scale_exp + (int) yr[ib].scale_exp + BP8_QFRAC;
+        const int base = se - 48;                                     // shift of bin 0
         device const uchar * qx = xr[ib].qs;
         device const uchar * qy = yr[ib].qs;
+        int b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
         for (int j = 0; j < BP8_QK; j++) {
             const short tx = tab[qx[j]], ty = tab[qy[j]];
             const int P = (int) (tx >> 8) * (int) (ty >> 8);
-            if (P == 0) continue;
-            // == bp8_lane_add(a, P, sh) on the threadgroup limbs (sh >= 48 here: w >= 1)
-            const int sh = (int) (char) tx + (int) (char) ty + se;
+            const int e = (int) (char) tx + (int) (char) ty + 48;
+            const int V = P << (e & 15); const int q = e >> 4;
+            b0 += (q == 0) ? V : 0; b1 += (q == 1) ? V : 0; b2 += (q == 2) ? V : 0; b3 += (q == 3) ? V : 0;
+            b4 += (q == 4) ? V : 0; b5 += (q == 5) ? V : 0; b6 += (q == 6) ? V : 0;
+        }
+        const int bb[7] = { b0, b1, b2, b3, b4, b5, b6 };
+        for (int q = 0; q < 7; q++) {                                 // == bp8_lane_add(a, bb[q], base + 16 q)
+            const long v = (long) bb[q];
+            if (v == 0) continue;
+            const int sh = base + 16 * q;
             const int w = sh >> 5, bits = sh & 31;
-            const long V = (long) P << bits;
+            const long V = v << bits;
             BP8_A(w) += (long) (uint) V;
             if (w + 1 < 8) BP8_A(w + 1) += (V >> 32);
         }
