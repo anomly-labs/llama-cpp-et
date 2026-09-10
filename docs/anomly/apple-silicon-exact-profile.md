@@ -96,6 +96,11 @@ on x86 and on the M4 GPU at `-t 4` and `-t 1` (4ff052bc5e3789da…): the attenti
 few hundred positions match, and the CPU thread count does not enter the result. The same prompt
 on Llama-3.2-1B (grouped-query attention, 5,237-line dump): 0413a484a93d0843… on both.
 
+Batched decode is covered too: `llama-batched -np 4 -kvu --temp 0 -fa off` (four sequences in
+flight on a unified KV cache; the dump hook now lives in `common/invar-logits.h` and is wired into
+this example) gives the same sorted digest on x86 and on the M4 GPU — SmolLM2-135M 14,906 lines
+(689bb13065a4c390…), Llama-3.2-1B 5,520 lines (da09e17c85beb944…).
+
 The receipts follow: `invar serve --binary build-metal/bin/llama-cli --device MTL0 --ngl 99`
 mints receipts on the GPU, and `invar verify --cross-deployment --device none --ngl 0` re-executes
 them on the CPU of the same machine: ACCEPT, output digest matches (SmolLM2-135M 2.5 s,
