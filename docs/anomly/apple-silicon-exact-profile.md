@@ -94,7 +94,8 @@ Gates, all on the M4 Pro:
 A ~500-token prompt (`-c 2048 -n 16`, SmolLM2-135M, 9,759-line dump) gives the same sorted digest
 on x86 and on the M4 GPU at `-t 4` and `-t 1` (4ff052bc5e3789da…): the attention kernels at a
 few hundred positions match, and the CPU thread count does not enter the result. The same prompt
-on Llama-3.2-1B (grouped-query attention, 5,237-line dump): 0413a484a93d0843… on both.
+on Llama-3.2-1B (grouped-query attention, 5,237-line dump): 0413a484a93d0843… on both, and on
+Mistral-7B (10,405-line dump): 0ffe802ea9458ed8… on both.
 
 Batched decode is covered too: `llama-batched -np 4 -kvu --temp 0 -fa off` (four sequences in
 flight on a unified KV cache; the dump hook now lives in `common/invar-logits.h` and is wired into
