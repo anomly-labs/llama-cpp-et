@@ -105,3 +105,10 @@ dispatches per token) to 3.5× the CPU on the 7B. The 7B runs in the 24 GB of un
 5.9 tokens/s with every activation, norm, softmax and attention product bit-identical to the x86
 build. Nothing uses the simdgroup matrix units (they are float) and the kernels are one simdgroup
 per output; there is headroom.
+
+For scale, the ordinary Metal path of the same source tree (`-DANOMLY_ALLOW_INEXACT_BACKENDS=ON`,
+Q8_0 weights, float accumulation, simdgroup matrices; not bit-reproducible across machines) on the
+same M4 Pro: SmolLM2-135M pp256 15,936 / tg64 381; Mistral-7B pp64 423 / tg32 31.2. The exact
+profile is currently 5.3× slower than that in 7B decode and about 50× slower in prefill. That is
+the price of exact, order-independent arithmetic with no floating-point unit in the loop, today;
+it is not a target this fork is trying to match.
