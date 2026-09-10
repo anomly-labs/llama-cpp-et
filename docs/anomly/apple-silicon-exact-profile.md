@@ -33,3 +33,38 @@ What this does and does not say:
   for this model, against 67.0 / 25.2 on the x86 host. A Metal port of the exact dots (the
   `ggml-det.h` header instantiated with Metal's IEEE operations, as `det.cuh` does for CUDA) is
   the open item.
+
+## Metal exact profile (2026-09-10, later the same day)
+
+There is now a Metal path that stays inside the exact profile. Build with
+
+    cmake -B build-metal -DGGML_METAL=ON -DANOMLY_METAL_EXACT=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-metal --target llama-cli -j
+
+What it does: the b-posit8 W8A8 matmuls run on the GPU through `ggml-metal-bposit8.h` — the
+reference activation quantiser (exact block scale, nearest-code encode) and the 256-bit exact
+accumulation with the single readout, written on 64-bit integers plus a software IEEE binary64
+(`ggml/src/ggml-det/det_soft.h`), because Metal has no `double`. Every other op the exact profile
+alters (RMSNorm, softmax, RoPE, SiLU/SwiGLU, the f16 attention matmuls, get_rows of quantised
+tensors) is declined by the backend and runs on the exact CPU path; the shader library is compiled
+with fast-math off. `ANOMLY_METAL_EXACT` is the only way Metal is allowed on in this fork.
+
+Gates, all on the M4 Pro:
+
+- `tests/anomly/metal-bp8-unit.mm`: the Metal arithmetic against the same header compiled on
+  the host — f32→binary64 (65,536), block scale (2,048 blocks), nearest encode (65,536), whole
+  block quantiser (2,048), 256-bit readout (2,048): 0 mismatches.
+- `tests/anomly/test-metal-bposit8.cpp`: MUL_MAT(bposit8, f32) on the Metal backend against the
+  CPU backend, random shapes K ≤ 768, N ≤ 200, M ≤ 9: **0 / 161,364 mismatches** over 300 trials.
+- The whole-graph gate above with `-ngl 99`: the 5,140-line dump is **byte-identical** to the x86
+  dump (sha256 `b5303ed6bb0e9e82…`), same text.
+
+The host-side software double is itself gated against hardware double on 2 × 10⁸ cases and the
+integer/soft-double b-posit8 path against `libggml-cpu` on 3 × 10⁵ rows (both on Linux; sources in
+the Anomly `space-time` repo, `research/metal-exact/`).
+
+Speed, SmolLM2-135M, 4 CPU threads: Metal build 61.7 prompt / 7.3 generation t/s versus the CPU
+build's 37.1 / 11.7. Prompt processing gains from the GPU matmuls; single-token generation loses
+to the per-op CPU↔GPU hand-offs of the declined ops. Moving RMSNorm, softmax, RoPE and the
+activations onto the GPU with the same software-double discipline is the next step; the f16
+attention matmuls would follow the same accumulate-and-read-out pattern.

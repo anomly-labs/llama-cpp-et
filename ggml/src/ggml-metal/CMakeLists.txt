@@ -22,6 +22,10 @@ target_link_libraries(ggml-metal PRIVATE
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
 endif()
+if (ANOMLY_METAL_EXACT)
+    target_compile_definitions(ggml-metal PRIVATE ANOMLY_METAL_EXACT)
+endif()
+set(METALLIB_BPOSIT8 "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal-bposit8.h")
 
 set(METALLIB_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-common.h")
 if (GGML_METAL_EMBED_LIBRARY)
@@ -44,13 +48,14 @@ if (GGML_METAL_EMBED_LIBRARY)
         COMMAND echo "Embedding Metal library"
         COMMAND sed -e "/__embed_ggml-common.h__/r ${METALLIB_COMMON}"       -e "/__embed_ggml-common.h__/d"         < "${METALLIB_SOURCE}"           > "${METALLIB_SOURCE_EMBED_TMP}"
         COMMAND sed -e "/\#include \"ggml-metal-impl.h\"/r ${METALLIB_IMPL}" -e "/\#include \"ggml-metal-impl.h\"/d" < "${METALLIB_SOURCE_EMBED_TMP}" > "${METALLIB_SOURCE_EMBED}"
+        COMMAND sed -i.bak -e "/\#include \"ggml-metal-bposit8.h\"/r ${METALLIB_BPOSIT8}" -e "/\#include \"ggml-metal-bposit8.h\"/d" "${METALLIB_SOURCE_EMBED}"
         COMMAND echo ".section __DATA,__ggml_metallib"          >  "${METALLIB_EMBED_ASM}"
         COMMAND echo ".globl _ggml_metallib_start"              >> "${METALLIB_EMBED_ASM}"
         COMMAND echo "_ggml_metallib_start:"                    >> "${METALLIB_EMBED_ASM}"
         COMMAND echo .incbin "\"${METALLIB_SOURCE_EMBED}\""     >> "${METALLIB_EMBED_ASM}"
         COMMAND echo ".globl _ggml_metallib_end"                >> "${METALLIB_EMBED_ASM}"
         COMMAND echo "_ggml_metallib_end:"                      >> "${METALLIB_EMBED_ASM}"
-        DEPENDS ../ggml-common.h ggml-metal.metal ggml-metal-impl.h
+        DEPENDS ../ggml-common.h ggml-metal.metal ggml-metal-impl.h ggml-metal-bposit8.h
         COMMENT "Generate assembly for embedded Metal library"
         VERBATIM
     )
@@ -61,6 +66,7 @@ else()
     configure_file(../ggml-common.h  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-common.h     COPYONLY)
     configure_file(ggml-metal.metal  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal  COPYONLY)
     configure_file(ggml-metal-impl.h ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal-impl.h COPYONLY)
+    configure_file(ggml-metal-bposit8.h ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal-bposit8.h COPYONLY)
 
     if (GGML_METAL_SHADER_DEBUG)
         # custom command to do the following:

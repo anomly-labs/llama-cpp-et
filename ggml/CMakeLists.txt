@@ -280,8 +280,17 @@ option(GGML_ZENDNN                          "ggml: use ZenDNN"                  
 # f16 attention matmuls with FMA accumulation when it is on. Opt out only for experiments; the
 # results then leave the profile and its receipts do not verify.
 option(ANOMLY_ALLOW_INEXACT_BACKENDS "llama-cpp-et: allow llamafile/BLAS/Accelerate/Metal/Vulkan/KleidiAI/HIP/SYCL/OpenCL (NOT the exact profile)" OFF)
+# ANOMLY_METAL_EXACT: keep GGML_METAL on, but only for the exact b-posit8 matmul kernel (integer +
+# software-double, ggml-metal-bposit8.h); every other Metal op the exact profile alters (norms,
+# softmax, rope, activations, f16 attention matmuls, get_rows of quantised types) is declined so
+# it runs on the exact CPU path, and the shader library is compiled with fast-math off.
+option(ANOMLY_METAL_EXACT "llama-cpp-et: Metal backend restricted to the exact b-posit8 kernel (stays in the exact profile)" OFF)
 if (NOT ANOMLY_ALLOW_INEXACT_BACKENDS)
-    foreach (opt GGML_LLAMAFILE GGML_BLAS GGML_ACCELERATE GGML_METAL GGML_VULKAN GGML_CPU_KLEIDIAI GGML_HIP GGML_SYCL GGML_OPENCL GGML_ZENDNN GGML_HEXAGON)
+    set(ANOMLY_FORCE_OFF GGML_LLAMAFILE GGML_BLAS GGML_ACCELERATE GGML_VULKAN GGML_CPU_KLEIDIAI GGML_HIP GGML_SYCL GGML_OPENCL GGML_ZENDNN GGML_HEXAGON)
+    if (NOT ANOMLY_METAL_EXACT)
+        list(APPEND ANOMLY_FORCE_OFF GGML_METAL)
+    endif()
+    foreach (opt ${ANOMLY_FORCE_OFF})
         if (${opt})
             message(STATUS "llama-cpp-et exact profile: forcing ${opt}=OFF (override with -DANOMLY_ALLOW_INEXACT_BACKENDS=ON; results then leave the exact profile)")
         endif()

@@ -493,6 +493,34 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv_ext;
 
+// Anomly exact b-posit8 matmul (ggml-metal-bposit8.h)
+typedef struct {
+    int64_t nblk_row;   // blocks per src1 row (ne10 / 32)
+    int64_t ne1;
+    int64_t ne2;
+    int64_t s1;         // src1 strides in floats
+    int64_t s2;
+    int64_t s3;
+    int64_t nblk_total;
+} ggml_metal_kargs_bp8_quant;
+
+typedef struct {
+    int32_t nblk;
+    int64_t ne01;
+    int64_t ne12;
+    int64_t s01;        // src0 strides in blocks
+    int64_t s02;
+    int64_t s03;
+    int64_t s11;        // quantised src1 strides in blocks (contiguous [i3][i2][i1][ib])
+    int64_t s12;
+    int64_t s13;
+    int64_t sd1;        // dst strides in floats
+    int64_t sd2;
+    int64_t sd3;
+    int32_t r2;
+    int32_t r3;
+} ggml_metal_kargs_bp8_mv;
+
 typedef struct {
     int32_t  ne02;
     int32_t  ne10;

@@ -59,6 +59,15 @@ ggml_metal_pipeline_t ggml_metal_pipelines_get(ggml_metal_pipelines_t ppls, cons
     return ppls->data[name];
 }
 
+// Anomly exact b-posit8 kernels (ggml-metal-bposit8.h): looked up by their plain names
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bposit8(ggml_metal_library_t lib, const char * kname) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, kname);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, kname, kname, nullptr);
+    }
+    return res;
+}
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml_metal_library_t lib, ggml_op op) {
     char base[256];
     char name[256];

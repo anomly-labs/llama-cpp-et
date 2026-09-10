@@ -229,6 +229,14 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 options.preprocessorMacros = prep;
 
                 //[options setFastMathEnabled:false];
+#ifdef ANOMLY_METAL_EXACT
+                // exact profile: no fast-math (no contraction, no reassociation, no flush-to-zero)
+                if (@available(macOS 15.0, iOS 18.0, *)) {
+                    options.mathMode = MTLMathModeSafe;
+                } else {
+                    [options setFastMathEnabled:false];
+                }
+#endif
 
                 library = [device newLibraryWithSource:src options:options error:&error];
                 if (error) {
@@ -1049,6 +1057,20 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+#ifdef ANOMLY_METAL_EXACT
+    // exact profile (Anomly): these ops have exact, order-independent CPU implementations in this
+    // fork (ggml-det); the Metal versions do not, so they are declined and fall back to the CPU.
+    switch (op->op) {
+        case GGML_OP_RMS_NORM: case GGML_OP_NORM: case GGML_OP_GROUP_NORM: case GGML_OP_L2_NORM:
+        case GGML_OP_SOFT_MAX: case GGML_OP_ROPE: case GGML_OP_ROPE_BACK:
+        case GGML_OP_UNARY: case GGML_OP_GLU:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_SUM: case GGML_OP_SUM_ROWS: case GGML_OP_MEAN: case GGML_OP_CUMSUM:
+        case GGML_OP_DIV: case GGML_OP_SQRT: case GGML_OP_LOG: case GGML_OP_SQR:
+            return false;
+        default: break;
+    }
+#endif
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
@@ -1274,7 +1296,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
+#ifdef ANOMLY_METAL_EXACT
+            // exact profile: only the exact b-posit8 kernel runs on the GPU; every other matmul
+            // (f16 attention, f32) stays on the exact CPU path
+            if (op->src[0]->type == GGML_TYPE_BPOSIT8) {
+                return has_simdgroup_reduction && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                       op->src[0]->ne[0] % 32 == 0 && op->src[0]->nb[0] == 33 && op->src[1]->nb[0] == sizeof(float);
+            }
+            return false;
+#endif
         case GGML_OP_MUL_MAT_ID:
+#ifdef ANOMLY_METAL_EXACT
+            return false;
+#endif
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -1335,6 +1369,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
+#ifdef ANOMLY_METAL_EXACT
+            // exact profile: dequantisation stays on the CPU until an exact Metal get_rows exists
+            if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_I32) return false;
+#endif
             return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {

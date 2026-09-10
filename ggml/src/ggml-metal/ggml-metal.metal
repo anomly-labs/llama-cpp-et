@@ -17,6 +17,8 @@ __embed_ggml-common.h__
 
 using namespace metal;
 
+#include "ggml-metal-bposit8.h"   // Anomly exact b-posit8 kernels (inlined by the embedder)
+
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }

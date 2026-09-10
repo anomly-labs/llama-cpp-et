@@ -1,5 +1,8 @@
 #include "ggml-metal-ops.h"
 
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -2040,8 +2043,112 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Anomly exact b-posit8 W8A8 matmul (ggml-metal-bposit8.h): quantise src1 to b-posit8 with the
+// reference rule, then one simdgroup per output element accumulates exactly. Bit-identical to the
+// CPU and CUDA kernels.
+// ---------------------------------------------------------------------------------------------
+size_t ggml_metal_op_mul_mat_bposit8_extra_tmp(const ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT || op->src[0]->type != GGML_TYPE_BPOSIT8) return 0;
+    const ggml_tensor * s1 = op->src[1];
+    const int64_t nblk_total = (s1->ne[0] / QK_BPOSIT8) * s1->ne[1] * s1->ne[2] * s1->ne[3];
+    return GGML_PAD((size_t) nblk_total * sizeof(block_bposit8), 16);
+}
+
+int ggml_metal_op_mul_mat_bposit8(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_BPOSIT8);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne00 % QK_BPOSIT8 == 0);
+    GGML_ASSERT(ne10 == ne00);
+    GGML_ASSERT(nb00 == sizeof(block_bposit8));
+    GGML_ASSERT(nb10 == sizeof(float));
+    GGML_ASSERT(nb0  == sizeof(float));
+    GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+
+    const int64_t nblk       = ne00 / QK_BPOSIT8;
+    const int64_t nblk_total = nblk * ne11 * ne12 * ne13;
+
+    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_buffer_id bid_tmp = bid_dst;                   // quantised src1 lives behind dst
+    bid_tmp.offs += ggml_nbytes(op);
+    if (getenv("GGML_BP8_DEBUG")) {
+        fprintf(stderr, "[bp8-metal] %s: ne00=%d ne01=%d ne11=%d ne12=%d ne13=%d nblk=%lld nblk_total=%lld dst.offs=%zu tmp.offs=%zu src1.offs=%zu\n",
+                op->name, ne00, ne01, ne11, ne12, ne13, (long long) nblk, (long long) nblk_total, bid_dst.offs, bid_tmp.offs, bid_src1.offs);
+    }
+
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_quantize_bposit8_f32");
+        ggml_metal_kargs_bp8_quant args = {
+            /*.nblk_row   =*/ nblk,
+            /*.ne1        =*/ ne11,
+            /*.ne2        =*/ ne12,
+            /*.s1         =*/ (int64_t) (nb11 / sizeof(float)),
+            /*.s2         =*/ (int64_t) (nb12 / sizeof(float)),
+            /*.s3         =*/ (int64_t) (nb13 / sizeof(float)),
+            /*.nblk_total =*/ nblk_total,
+        };
+        const int nth = 128;
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (nblk_total + nth - 1) / nth, 1, 1, nth, 1, 1);
+    }
+    // the encoder dispatches concurrently: the matmul must see the quantised src1
+    ggml_metal_encoder_memory_barrier(enc);
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_mul_mv_bposit8_exact");
+        const int nsg = 4;                                     // BP8_NSG in the shader
+        ggml_metal_kargs_bp8_mv args = {
+            /*.nblk =*/ (int32_t) nblk,
+            /*.ne01 =*/ ne01,
+            /*.ne12 =*/ ne12,
+            /*.s01  =*/ (int64_t) (nb01 / sizeof(block_bposit8)),
+            /*.s02  =*/ (int64_t) (nb02 / sizeof(block_bposit8)),
+            /*.s03  =*/ (int64_t) (nb03 / sizeof(block_bposit8)),
+            /*.s11  =*/ nblk,
+            /*.s12  =*/ nblk * ne11,
+            /*.s13  =*/ nblk * ne11 * ne12,
+            /*.sd1  =*/ (int64_t) (nb1 / sizeof(float)),
+            /*.sd2  =*/ (int64_t) (nb2 / sizeof(float)),
+            /*.sd3  =*/ (int64_t) (nb3 / sizeof(float)),
+            /*.r2   =*/ (int32_t) (ne12 / ne02),
+            /*.r3   =*/ (int32_t) (ne13 / ne03),
+        };
+        const size_t smem = (size_t) nsg * 32 * 8 * sizeof(int64_t);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nsg - 1) / nsg, ne11, ne12 * ne13, 32, nsg, 1);
+    }
+    return 1;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (op->src[0]->type == GGML_TYPE_BPOSIT8) {
+        return ggml_metal_op_mul_mat_bposit8(ctx, idx);
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
