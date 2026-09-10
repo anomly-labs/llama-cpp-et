@@ -106,26 +106,26 @@ the kernel tail); the softmax kernel now keeps its tail uniform. (2) The subnorm
 uses float hardware needs a subnormal test.
 
 Speed (`llama-bench -p 256 -n 64 -fa 0 -t 8`, M4 Pro 14-core, tokens/s, GPU = `-ngl 99`, CPU = the
-same build with `-ngl 0`; the per-lane limbs of the exact matvec in threadgroup memory, 966ddd4bd):
+same build with `-ngl 0`; matvec with seven 16-bit-granular register bins per block pair):
 
 | model | GPU pp256 | GPU tg64 | CPU pp256 | CPU tg64 | GPU/CPU decode |
 |---|---|---|---|---|---|
-| SmolLM2-135M | 219.1 | 52.9 | 108.9 | 55.2 | 0.96× |
-| Qwen2.5-0.5B | 110.5 | 34.4 | 59.9 | 18.8 | 1.8× |
-| Llama-3.2-1B | 54.6 | 25.3 | 27.7 | 8.8 | 2.9× |
-| Mistral-7B (`-p 64 -n 32`) | 8.5 | 5.9 | 4.0 | 1.7 | 3.5× |
+| SmolLM2-135M | 283.9 | 57.3 | 108.9 | 55.2 | 1.0× |
+| Qwen2.5-0.5B | 149.2 | 39.7 | 59.9 | 18.8 | 2.1× |
+| Llama-3.2-1B | 79.9 | 32.1 | 27.7 | 8.8 | 3.6× |
+| Mistral-7B (`-p 64 -n 32`) | 13.4 | 8.1 | 4.0 | 1.7 | 4.8× |
 
 Prompt processing is compute-bound in the exact matvec (no floating-point unit is used; the
-integer work per multiply-accumulate is what limits it) and runs at about 2× the 8-thread CPU;
+integer work per multiply-accumulate is what limits it) and runs at 2.6–3.3× the 8-thread CPU;
 single-token generation on the GPU scales from parity on the 135M model (about 750 dependent
-dispatches per token) to 3.5× the CPU on the 7B. The 7B runs in the 24 GB of unified memory at
-5.9 tokens/s with every activation, norm, softmax and attention product bit-identical to the x86
+dispatches per token) to 4.8× the CPU on the 7B. The 7B runs in the 24 GB of unified memory at
+8.1 tokens/s with every activation, norm, softmax and attention product bit-identical to the x86
 build. Nothing uses the simdgroup matrix units (they are float) and the kernels are one simdgroup
 per output; there is headroom.
 
 For scale, the ordinary Metal path of the same source tree (`-DANOMLY_ALLOW_INEXACT_BACKENDS=ON`,
 Q8_0 weights, float accumulation, simdgroup matrices; not bit-reproducible across machines) on the
 same M4 Pro: SmolLM2-135M pp256 15,936 / tg64 381; Mistral-7B pp64 423 / tg32 31.2. The exact
-profile is currently 5.3× slower than that in 7B decode and about 50× slower in prefill. That is
+profile is currently 3.9× slower than that in 7B decode and about 32× slower in prefill. That is
 the price of exact, order-independent arithmetic with no floating-point unit in the loop, today;
 it is not a target this fork is trying to match.
