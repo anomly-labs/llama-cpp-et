@@ -80,6 +80,7 @@ Gates, all on the M4 Pro:
   | SmolLM2-135M-Instruct b-posit8 | 5,140 | 68edecdc52a5e19e… | identical |
   | Qwen2.5-0.5B-Instruct b-posit8 | 4,840 | ea35e8c5422b36cc… | identical |
   | Llama-3.2-1B-Instruct b-posit8 | 2,760 | e5e923a1cff55347… | identical |
+  | Mistral-7B-Instruct-v0.3 b-posit8 | 5,480 | b244655a42e81053… | identical |
 
 Two things the port found that matter beyond this fork. (1) A heavy thread-0-only block followed
 by a threadgroup barrier and a broadcast miscompiled on the M4 Pro (threads 1..31 never executed
@@ -95,8 +96,9 @@ same build with `-ngl 0`):
 | SmolLM2-135M | 125.9 | 43.6 (-t 4) / 42.4 (-t 8) | 108.9 | 55.2 |
 | Qwen2.5-0.5B | 61.0 | 25.2 | 59.9 | 18.8 |
 | Llama-3.2-1B | 28.0 | 16.0 | 27.7 | 8.8 |
+| Mistral-7B (`-p 64 -n 32`) | 4.1 | 3.3 | 4.0 | 1.7 |
 
 Prompt processing is compute-bound in the exact matvec on both sides and lands within a few percent
-either way; single-token generation on the GPU is 1.3× (0.5B) and 1.8× (1B) the 8-thread CPU rate,
+either way; single-token generation on the GPU is 1.3× (0.5B), 1.8× (1B) and 2.0× (7B) the 8-thread CPU rate,
 and loses to 8 threads only on the 135M model, where ~750 dependent dispatches per token dominate.
 Nothing here is tuned for throughput yet (one simdgroup per output, no simdgroup matrix units).
