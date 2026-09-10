@@ -2146,7 +2146,6 @@ static int ggml_metal_op_mul_mat_f16_exact(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, (size_t) nsg * 32 * 8 * sizeof(int64_t), 0);   // per-lane limbs
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nsg - 1) / nsg, ne11, ne12 * ne13, 32, nsg, 1);
     }
     return 1;
