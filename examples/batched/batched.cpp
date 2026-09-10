@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "invar-logits.h"   // Anomly INVAR whole-graph dump hook (INVAR_LOGITS_OUT), as in llama-cli
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -63,6 +64,10 @@ int main(int argc, char ** argv) {
 
     // initialize the context
 
+    if (const char * logits_out = getenv("INVAR_LOGITS_OUT")) {
+        params.cb_eval           = invar_logits_cb;
+        params.cb_eval_user_data = (void *) logits_out;
+    }
     llama_context_params ctx_params = common_context_params_to_llama(params);
 
     ctx_params.n_ctx   = n_kv_req;
