@@ -1582,6 +1582,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_l
     const bool is_rb = ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && (ggml_nrows(op->src[1]) == 1) && ggml_nelements(op) < 65536;
 
     snprintf(base, 256, "kernel_bin_fuse_%s_%s_%s%s", t0_str, t1_str, t_str, is_c4 ? "_4" : "");
+#ifdef ANOMLY_METAL_EXACT
+    snprintf(base, 256, "kernel_bin_exact_%s_%s_%s", t0_str, t1_str, t_str);   // software binary32, no float4 path
+#endif
     snprintf(name, 256, "%s_op=%d_nf=%d_rb=%d_cb=%d", base, op_num, n_fuse, is_rb, is_cb);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1599,6 +1602,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_l
     }
 
     res.c4  = is_c4;
+#ifdef ANOMLY_METAL_EXACT
+    res.c4  = false;
+#endif
     res.cnt = is_rb;
 
     return res;
@@ -1619,6 +1625,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one(ggml_met
     };
 
     snprintf(base, 256, "kernel_bin_fuse_%s_%s_%s", "f32", "f32", "f32");
+#ifdef ANOMLY_METAL_EXACT
+    snprintf(base, 256, "kernel_bin_exact_%s_%s_%s", "f32", "f32", "f32");
+#endif
     snprintf(name, 256, "%s_op=%d_nf=%d", base, op_num, 1);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -1334,6 +1334,8 @@ kernel void kernel_swiglu_f32_exact(
 // vector overloads for the unary kernel's float4 instantiation
 static inline float  dso_silu_v(float  x) { return dso_siluf(x); }
 static inline float4 dso_silu_v(float4 x) { return float4(dso_siluf(x.x), dso_siluf(x.y), dso_siluf(x.z), dso_siluf(x.w)); }
+static inline float  dso_scale_v(float  x, float s) { return dso_fmul(x, s); }
+static inline float4 dso_scale_v(float4 x, float s) { return float4(dso_fmul(x.x, s), dso_fmul(x.y, s), dso_fmul(x.z, s), dso_fmul(x.w, s)); }
 static inline float  dso_gelu_v(float  x) { return dso_geluf(x); }
 static inline float4 dso_gelu_v(float4 x) { return float4(dso_geluf(x.x), dso_geluf(x.y), dso_geluf(x.z), dso_geluf(x.w)); }
 #endif // __METAL_VERSION__

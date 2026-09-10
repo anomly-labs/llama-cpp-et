@@ -1067,8 +1067,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_NORM: case GGML_OP_GROUP_NORM: case GGML_OP_L2_NORM: case GGML_OP_ROPE_BACK:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_SUM: case GGML_OP_SUM_ROWS: case GGML_OP_MEAN: case GGML_OP_CUMSUM:
-        case GGML_OP_DIV: case GGML_OP_SQRT: case GGML_OP_LOG: case GGML_OP_SQR:
+        case GGML_OP_SQRT: case GGML_OP_LOG: case GGML_OP_SQR:
+        case GGML_OP_ADD_ID: case GGML_OP_ACC: case GGML_OP_FILL: case GGML_OP_CLAMP:
             return false;
+        case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_MUL: case GGML_OP_DIV:   // exact binary kernel: f32 only
+            if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            break;
+        case GGML_OP_SCALE: {    // exact: x*s on the software binary32; a bias needs the CPU's FMA path
+            float bias; memcpy(&bias, ((const float *) op->op_params) + 1, sizeof(float));
+            if (op->src[0]->type != GGML_TYPE_F32 || bias != 0.0f) return false;
+            break; }
         case GGML_OP_RMS_NORM:   // exact kernel: f32, contiguous rows
             if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(op->src[0])) return false;
             break;

@@ -57,7 +57,12 @@ exact-profile kernels use no floating-point hardware at all for anything that to
 - **RMSNorm, softmax (f16/f32 mask, sinks), RoPE (norm/neox, no YaRN), SwiGLU, SiLU, GELU**: the
   reference's routines on the software binary64 (`ggml/src/ggml-det/det_soft_ops.h`, generated),
   and every float multiply/add/divide/sqrt/max in those kernels on a software binary32 layer
-  (`dso_f*_bits`) so subnormals survive. `get_rows` of quantised tensors stays on the CPU.
+  (`dso_f*_bits`) so subnormals survive.
+- **ADD / SUB / MUL / DIV (residuals, biases, broadcasts, the fused ADD chain) and SCALE without
+  bias**: the same indexing and fusion as the upstream kernels, arithmetic on the software
+  binary32. The upstream hardware kernels flush subnormal results — measured: an ADD whose exact
+  result is 0x1.2a4028p-126 returned 0 — so they are not used. `get_rows` of quantised tensors and
+  SCALE with a bias (the CPU uses an FMA there) stay on the CPU.
 - The shader library is compiled with fast-math off. `ANOMLY_METAL_EXACT` is the only way Metal
   is allowed on in this fork; ops without an exact kernel are declined by `supports_op`.
 
@@ -66,10 +71,11 @@ Gates, all on the M4 Pro:
 - `tests/anomly/metal_ops_gate.mm`: the software float ops **inside a Metal kernel** against the
   same header on the host — mul/add/sub/div/sqrt/max, expf, tanhf, silu, f16→f32, and the
   integer quire readout against the reference Horner: 2 × 10⁶ + 5 × 10⁵ cases, 0 mismatches.
-- `tests/anomly/test-metal-bposit8.cpp ops 200`: eleven ops on the Metal backend against the CPU
-  backend, random shapes, a subnormal-heavy input stream: rms_norm (+mul), soft_max (f16 mask,
-  plain), rope (norm, neox), swiglu, silu, gelu, mul_mat f16 (contiguous, permuted): **all 0
-  mismatches** (636,384 elements per elementwise op); the b-posit8 matmul gate 0 / 8,288.
+- `tests/anomly/test-metal-bposit8.cpp ops 200`: twenty-two op variants on the Metal backend
+  against the CPU backend, random shapes, a subnormal-heavy input stream: rms_norm (+mul),
+  soft_max (f16 mask, plain), rope (norm, neox), swiglu, silu, gelu, mul_mat f16 (contiguous,
+  permuted), add (+scale, ×3 fused, row broadcast), sub, mul (ne0 broadcast), div, scale, cpy
+  f32→f16(→f32), set_rows f32→f16: **all 0 mismatches**; the b-posit8 matmul gate 0 / 8,288.
 - Whole-graph dumps (`INVAR_LOGITS_OUT`, layer-1 matmuls, logits, tokens) with `-ngl 99` against
   the x86 dumps, compared tensor-by-tensor and as `LC_ALL=C sort | sha256sum` (the Metal graph
   optimizer schedules Qcur_rope/Kcur_rope after Vcur, so the raw line order differs; nothing

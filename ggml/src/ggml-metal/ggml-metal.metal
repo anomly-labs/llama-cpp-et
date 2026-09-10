@@ -1065,7 +1065,11 @@ kernel void kernel_unary_impl(
         const TC x = (TC) src0_ptr[i0];
 
         if (FC_OP == OP_UNARY_NUM_SCALE) {
+#ifdef ANOMLY_METAL_EXACT
+            dst_ptr[i0] = (T) dso_scale_v(x, args.scale);   // bias == 0 enforced by supports_op; software binary32
+#else
             dst_ptr[i0] = (T) (args.scale * x + args.bias);
+#endif
         }
 
         if (FC_OP == OP_UNARY_NUM_FILL) {
@@ -1377,6 +1381,58 @@ typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
 
 template [[host_name("kernel_bin_fuse_f32_f32_f32")]]   kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float,  float,  float>;
 template [[host_name("kernel_bin_fuse_f32_f32_f32_4")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float4, float4, float4>;
+
+#ifdef ANOMLY_METAL_EXACT
+// Anomly exact profile: the same indexing and ADD fusion as kernel_bin_fuse_impl, arithmetic on
+// the software binary32 (Apple GPUs flush float subnormals; the CPU reference keeps them)
+static inline float dso_bin_op(short op, float a, float b) {
+    return op == 0 ? dso_fadd(a, b) : op == 1 ? dso_fsub(a, b) : op == 2 ? dso_fmul(a, b) : dso_fdiv(a, b);
+}
+kernel void kernel_bin_exact_f32_f32_f32(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (FC_bin_rb) {
+        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
+        const uint i1 = FC_bin_cb ? tgpig.x%args.ne10 : tgpig.x;
+        device const float * src0_row = (device const float *) (src0);
+        device       float * dst_row  = (device       float *) (dst);
+        float res = src0_row[i0];
+        for (short j = 0; j < FC_bin_f; ++j) {
+            res = dso_bin_op(FC_bin_op, res, ((device const float *) (src1 + args.o1[j]))[i1]);
+        }
+        dst_row[i0] = res;
+    } else {
+        const int i03 = tgpig.z;
+        const int i02 = tgpig.y;
+        const int i01 = tgpig.x;
+        if (i01 >= args.ne01) {
+            return;
+        }
+        const int i13 = i03%args.ne13;
+        const int i12 = i02%args.ne12;
+        const int i11 = i01%args.ne11;
+        device const float * src0_ptr = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs);
+        device       float * dst_ptr  = (device       float *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs);
+        device const float * src1_ptr[8];
+        for (short j = 0; j < FC_bin_f; ++j) {
+            src1_ptr[j] = (device const float *) (src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+        }
+        for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            const int i10 = FC_bin_cb ? i0%args.ne10 : i0;
+            float res = src0_ptr[i0];
+            for (short j = 0; j < FC_bin_f; ++j) {
+                res = dso_bin_op(FC_bin_op, res, src1_ptr[j][i10]);
+            }
+            dst_ptr[i0] = res;
+        }
+    }
+}
+#endif
 
 kernel void kernel_add_id(
         constant ggml_metal_kargs_add_id & args,

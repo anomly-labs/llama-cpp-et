@@ -65,6 +65,12 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
                 ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, ne1 * ne2); ins_rows = rows;
                 y = ggml_set_rows(ctx, dst16, ggml_reshape_2d(ctx, x, ne0, ne1 * ne2), rows);
             }
+            if (variant == 16) { ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2); ins_extra = g; y = ggml_sub(ctx, x, g); }
+            if (variant == 17) { ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2); ins_extra = g; y = ggml_div(ctx, x, g); }
+            if (variant == 18) { ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2); ins_extra = g; y = ggml_add(ctx, ggml_add(ctx, ggml_add(ctx, x, g), g), g); }   // fused ADD chain
+            if (variant == 19) { ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0); ins_extra = g; y = ggml_add(ctx, x, g); }              // row broadcast (bias add)
+            if (variant == 20) { ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ne1, ne2); ins_extra = g; y = ggml_mul(ctx, x, g); }     // ne0 broadcast (cb)
+            if (variant == 21) { y = ggml_scale(ctx, x, -0.37f); }                                                                                     // scale, no bias
             if (variant == 9 || variant == 10) {
                 // MUL_MAT(f16 W [K x N x H], f32 X [K x M x H*r]); variant 10 = permuted (non-contiguous) src1 rows + transposed-view src0
                 const int K = 16 * (1 + (t % 12)) + (t % 3), N = 1 + (t % 9), H = 1 + (t % 2), M = ne1, r = 1 + (t % 2);
@@ -90,7 +96,7 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
             if (g) { std::vector<float> gv(xv.size()); for (auto & v : gv) v = rf(); ggml_backend_tensor_set(g, gv.data(), 0, gv.size() * 4); }
             if (m) { std::vector<uint16_t> mv((size_t) ne0 * ne1); for (size_t i = 0; i < mv.size(); i++) { float f = (r64() % 5 == 0) ? -INFINITY : ((int)(r64() % 9) - 4) * 0.5f; mv[i] = ggml_fp32_to_fp16(f); } ggml_backend_tensor_set(m, mv.data(), 0, mv.size() * 2); }
             if (pos) { std::vector<int32_t> pv(ne2); for (int i = 0; i < ne2; i++) pv[i] = (int) (r64() % 4096); ggml_backend_tensor_set(pos, pv.data(), 0, pv.size() * 4); }
-            if (ins_extra) { std::vector<float> ev(xv.size()); for (auto & v : ev) v = rf(); ggml_backend_tensor_set(ins_extra, ev.data(), 0, ev.size() * 4); }
+            if (ins_extra) { std::vector<float> ev(ggml_nelements(ins_extra)); for (auto & v : ev) v = rf(); ggml_backend_tensor_set(ins_extra, ev.data(), 0, ev.size() * 4); }
             if (ins_rows) { std::vector<int64_t> rv(ne1 * ne2); for (int i = 0; i < ne1 * ne2; i++) rv[i] = (ne1 * ne2 - 1 - i); ggml_backend_tensor_set(ins_rows, rv.data(), 0, rv.size() * 8); }
             ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, y);
             ggml_backend_graph_compute(be == 0 ? cpu : gpu, gf);
@@ -177,9 +183,9 @@ int main(int argc, char ** argv) {
         ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         const int trials = argc > 2 ? atoi(argv[2]) : 24;
         long bad = 0;
-        const char * names[16] = { "rms_norm", "rms_norm+mul", "soft_max f16m", "soft_max plain", "rope norm", "rope neox", "swiglu", "silu", "gelu", "mul_mat f16", "mul_mat f16 perm", "add+scale f32", "mul f32", "cpy f32->f16", "cpy f32->f16->f32", "set_rows f32->f16" };
+        const char * names[22] = { "rms_norm", "rms_norm+mul", "soft_max f16m", "soft_max plain", "rope norm", "rope neox", "swiglu", "silu", "gelu", "mul_mat f16", "mul_mat f16 perm", "add+scale f32", "mul f32", "cpy f32->f16", "cpy f32->f16->f32", "set_rows f32->f16", "sub f32", "div f32", "add x3 fused", "add row bcast", "mul ne0 bcast", "scale f32" };
         const int only = argc > 3 ? atoi(argv[3]) : -1;
-        for (int v = 0; v < 16; v++) { if (only >= 0 && v != only) continue; bad += gate_op(cpu, gpu, names[v], v, trials); }
+        for (int v = 0; v < 22; v++) { if (only >= 0 && v != only) continue; bad += gate_op(cpu, gpu, names[v], v, trials); }
         printf("ALL OP GATES: %s\n", bad ? "FAIL" : "PASS");
         return bad ? 1 : 0;
     }
