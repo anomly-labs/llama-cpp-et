@@ -206,6 +206,37 @@ kernel void kernel_mul_mv_bposit8_exact(
     dst[i3 * args.sd3 + i2 * args.sd2 + i1 * args.sd1 + row] = as_type<float>(out);
 }
 
+// get_rows for b-posit8 (the embedding lookup): the CPU's (float)(value[code] * 2^scale_exp) on
+// the software double — the same single rounding, subnormal floats included. One thread per 16
+// elements (the op's ne00t = ne00/16 convention for quantised types).
+kernel void kernel_get_rows_bposit8(
+        constant ggml_metal_kargs_get_rows & args,
+        device const void * src0,
+        device const void * src1,
+        device       void * dst,
+        uint3               tgpig[[threadgroup_position_in_grid]],
+        ushort              tiitg[[thread_index_in_threadgroup]],
+        ushort3             ntg  [[threads_per_threadgroup]]) {
+    const int32_t iw0 = tgpig.x/args.ne10;
+    const int32_t i10 = tgpig.x%args.ne10;
+    const int32_t i11 = tgpig.y;
+    const int32_t i12 = tgpig.z;
+    const int32_t r = ((const device int32_t *) ((const device char *) src1 + i12*args.nb12 + i11*args.nb11 + i10*args.nb10))[0];
+    const int32_t i02 = i11;
+    const int32_t i03 = i12;
+    device const block_bposit8 * psrc = (device const block_bposit8 *) ((const device char *) src0 + i03*args.nb03 + i02*args.nb02 + r*args.nb01);
+    device       float         * pdst = (device       float *)         ((      device char *) dst  + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
+    const int ind = iw0*ntg.x + tiitg;
+    if (ind >= args.ne00t) return;
+    device const block_bposit8 * b = psrc + ind/2;
+    const int se = (int) b->scale_exp;
+    const int j0 = (ind % 2) * 16;
+    for (int j = 0; j < 16; j++) {
+        const ulong v = bp8_code_to_dbits((uint) b->qs[j0 + j]);       // exact value of the code (double bits)
+        pdst[ind * 16 + j] = as_type<float>(ds_to_f32bits(v == 0 ? 0ul : ds_ldexp(v, se)));
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // exact f16 matmul (attention KQ / KQV with -fa off): src1 f32 -> f16 (IEEE RN-even, integer
 // form == ggml_cpu_fp32_to_fp16), then det_dot_f16 per output: products M*M at 2^(Ex+Ey) into

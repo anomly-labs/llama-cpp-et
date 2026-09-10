@@ -71,6 +71,21 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
             if (variant == 19) { ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0); ins_extra = g; y = ggml_add(ctx, x, g); }              // row broadcast (bias add)
             if (variant == 20) { ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ne1, ne2); ins_extra = g; y = ggml_mul(ctx, x, g); }     // ne0 broadcast (cb)
             if (variant == 21) { y = ggml_scale(ctx, x, -0.37f); }                                                                                     // scale, no bias
+            if (variant == 22) {                                   // get_rows bposit8 (embedding lookup)
+                const int K = 32 * (1 + (t % 24)), N = 4 + (t % 13), R = 1 + (t % 5);
+                ggml_tensor * e = ggml_new_tensor_2d(ctx, GGML_TYPE_BPOSIT8, K, N);
+                ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, R);
+                y = ggml_get_rows(ctx, e, ids);
+                ggml_backend_buffer_t bufe = ggml_backend_alloc_ctx_tensors(ctx, be == 0 ? cpu : gpu);
+                std::vector<uint8_t> eb(ggml_nbytes(e)); for (size_t i = 0; i < eb.size(); i++) eb[i] = (i % 33 == 0) ? (uint8_t) (int8_t) ((int) (r64() % 256) - 128) : (uint8_t) (r64() % 256);
+                ggml_backend_tensor_set(e, eb.data(), 0, eb.size());
+                std::vector<int32_t> iv(R); for (int i = 0; i < R; i++) iv[i] = (int) (r64() % N); ggml_backend_tensor_set(ids, iv.data(), 0, R * 4);
+                ggml_cgraph * gfe = ggml_new_graph(ctx); ggml_build_forward_expand(gfe, y);
+                ggml_backend_graph_compute(be == 0 ? cpu : gpu, gfe);
+                outs[be].resize(ggml_nelements(y)); ggml_backend_tensor_get(y, outs[be].data(), 0, outs[be].size() * 4);
+                ggml_backend_buffer_free(bufe); ggml_free(ctx);
+                continue;
+            }
             if (variant == 9 || variant == 10) {
                 // MUL_MAT(f16 W [K x N x H], f32 X [K x M x H*r]); variant 10 = permuted (non-contiguous) src1 rows + transposed-view src0
                 const int K = 16 * (1 + (t % 12)) + (t % 3), N = 1 + (t % 9), H = 1 + (t % 2), M = ne1, r = 1 + (t % 2);
@@ -183,9 +198,9 @@ int main(int argc, char ** argv) {
         ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         const int trials = argc > 2 ? atoi(argv[2]) : 24;
         long bad = 0;
-        const char * names[22] = { "rms_norm", "rms_norm+mul", "soft_max f16m", "soft_max plain", "rope norm", "rope neox", "swiglu", "silu", "gelu", "mul_mat f16", "mul_mat f16 perm", "add+scale f32", "mul f32", "cpy f32->f16", "cpy f32->f16->f32", "set_rows f32->f16", "sub f32", "div f32", "add x3 fused", "add row bcast", "mul ne0 bcast", "scale f32" };
+        const char * names[23] = { "rms_norm", "rms_norm+mul", "soft_max f16m", "soft_max plain", "rope norm", "rope neox", "swiglu", "silu", "gelu", "mul_mat f16", "mul_mat f16 perm", "add+scale f32", "mul f32", "cpy f32->f16", "cpy f32->f16->f32", "set_rows f32->f16", "sub f32", "div f32", "add x3 fused", "add row bcast", "mul ne0 bcast", "scale f32", "get_rows bposit8" };
         const int only = argc > 3 ? atoi(argv[3]) : -1;
-        for (int v = 0; v < 22; v++) { if (only >= 0 && v != only) continue; bad += gate_op(cpu, gpu, names[v], v, trials); }
+        for (int v = 0; v < 23; v++) { if (only >= 0 && v != only) continue; bad += gate_op(cpu, gpu, names[v], v, trials); }
         printf("ALL OP GATES: %s\n", bad ? "FAIL" : "PASS");
         return bad ? 1 : 0;
     }
