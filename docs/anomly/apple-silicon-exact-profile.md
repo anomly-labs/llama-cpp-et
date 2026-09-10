@@ -88,17 +88,20 @@ the kernel tail); the softmax kernel now keeps its tail uniform. (2) The subnorm
 "safe" math mode is not IEEE on Apple GPUs, so any bit-exactness claim for a Metal kernel that
 uses float hardware needs a subnormal test.
 
-Speed (`llama-bench -p 256 -n 64 -fa 0`, M4 Pro 14-core, tokens/s, GPU = `-ngl 99`, CPU = the
-same build with `-ngl 0`):
+Speed (`llama-bench -p 256 -n 64 -fa 0 -t 8`, M4 Pro 14-core, tokens/s, GPU = `-ngl 99`, CPU = the
+same build with `-ngl 0`; the per-lane limbs of the exact matvec in threadgroup memory, 966ddd4bd):
 
-| model | GPU pp256 | GPU tg64 | CPU -t 8 pp256 | CPU -t 8 tg64 |
-|---|---|---|---|---|
-| SmolLM2-135M | 125.9 | 43.6 (-t 4) / 42.4 (-t 8) | 108.9 | 55.2 |
-| Qwen2.5-0.5B | 61.0 | 25.2 | 59.9 | 18.8 |
-| Llama-3.2-1B | 28.0 | 16.0 | 27.7 | 8.8 |
-| Mistral-7B (`-p 64 -n 32`) | 4.1 | 3.3 | 4.0 | 1.7 |
+| model | GPU pp256 | GPU tg64 | CPU pp256 | CPU tg64 | GPU/CPU decode |
+|---|---|---|---|---|---|
+| SmolLM2-135M | 219.1 | 52.9 | 108.9 | 55.2 | 0.96× |
+| Qwen2.5-0.5B | 110.5 | 34.4 | 59.9 | 18.8 | 1.8× |
+| Llama-3.2-1B | 54.6 | 25.3 | 27.7 | 8.8 | 2.9× |
+| Mistral-7B (`-p 64 -n 32`) | 8.5 | 5.9 | 4.0 | 1.7 | 3.5× |
 
-Prompt processing is compute-bound in the exact matvec on both sides and lands within a few percent
-either way; single-token generation on the GPU is 1.3× (0.5B), 1.8× (1B) and 2.0× (7B) the 8-thread CPU rate,
-and loses to 8 threads only on the 135M model, where ~750 dependent dispatches per token dominate.
-Nothing here is tuned for throughput yet (one simdgroup per output, no simdgroup matrix units).
+Prompt processing is compute-bound in the exact matvec (no floating-point unit is used; the
+integer work per multiply-accumulate is what limits it) and runs at about 2× the 8-thread CPU;
+single-token generation on the GPU scales from parity on the 135M model (about 750 dependent
+dispatches per token) to 3.5× the CPU on the 7B. The 7B runs in the 24 GB of unified memory at
+5.9 tokens/s with every activation, norm, softmax and attention product bit-identical to the x86
+build. Nothing uses the simdgroup matrix units (they are float) and the kernels are one simdgroup
+per output; there is headroom.
