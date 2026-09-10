@@ -96,7 +96,7 @@ mints receipts on the GPU, and `invar verify --cross-deployment --device none --
 them on the CPU of the same machine: ACCEPT, output digest matches (SmolLM2-135M 2.5 s,
 Llama-3.2-1B 17.4 s). The independent Go reference implementation (no llama.cpp, x86) replays the
 Apple-GPU dumps bit-exactly: SmolLM2-135M 4,230 traced rows + logits, Qwen2.5-0.5B 4,110,
-Llama-3.2-1B 2,270; the Python reference agrees. So for these graphs: x86 CPU == M4 Pro CPU ==
+Llama-3.2-1B 2,270, Mistral-7B 4,510; the Python reference agrees. So for these graphs: x86 CPU == M4 Pro CPU ==
 M4 Pro GPU == Go reference == Python reference.
 
 Two things the port found that matter beyond this fork. (1) A heavy thread-0-only block followed
