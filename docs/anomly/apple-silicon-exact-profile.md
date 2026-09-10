@@ -34,38 +34,69 @@ What this does and does not say:
   `ggml-det.h` header instantiated with Metal's IEEE operations, as `det.cuh` does for CUDA) is
   the open item.
 
-## Metal exact profile (2026-09-10, later the same day)
+## Metal exact profile (2026-09-10)
 
-There is now a Metal path that stays inside the exact profile. Build with
+There is now a Metal path that stays inside the exact profile and runs the **whole graph on the
+GPU**. Build with
 
     cmake -B build-metal -DGGML_METAL=ON -DANOMLY_METAL_EXACT=ON -DCMAKE_BUILD_TYPE=Release
     cmake --build build-metal --target llama-cli -j
 
-What it does: the b-posit8 W8A8 matmuls run on the GPU through `ggml-metal-bposit8.h` — the
-reference activation quantiser (exact block scale, nearest-code encode) and the 256-bit exact
-accumulation with the single readout, written on 64-bit integers plus a software IEEE binary64
-(`ggml/src/ggml-det/det_soft.h`), because Metal has no `double`. Every other op the exact profile
-alters (RMSNorm, softmax, RoPE, SiLU/SwiGLU, the f16 attention matmuls, get_rows of quantised
-tensors) is declined by the backend and runs on the exact CPU path; the shader library is compiled
-with fast-math off. `ANOMLY_METAL_EXACT` is the only way Metal is allowed on in this fork.
+What it does. Metal has no `double` and Apple GPUs flush single-precision subnormals to zero
+(measured on the M4 Pro even with `MTLMathModeSafe` and `#pragma METAL fp contract(off)`), so the
+exact-profile kernels use no floating-point hardware at all for anything that touches a result:
+
+- **b-posit8 W8A8 matmuls** (`kernel_quantize_bposit8_f32_sg`, `kernel_mul_mv_bposit8_exact`):
+  the reference activation quantiser (exact block scale from the exact sum of squares, nearest-code
+  encode on a software IEEE binary64) and the 256-bit exact accumulation with the single readout,
+  on 64-bit integers. The quantised activation is reused across the adjacent Q/K/V (and gate/up)
+  projections.
+- **f16 attention matmuls** (`-fa off`; `kernel_cvt_f32_f16_det`, `kernel_mul_mv_f16_exact`):
+  f32→f16 in integers (IEEE round-to-nearest-even, the same result as the CPU conversion), then
+  the exact f16 dot through the same quire and readout as the CPU / CUDA kernels.
+- **RMSNorm, softmax (f16/f32 mask, sinks), RoPE (norm/neox, no YaRN), SwiGLU, SiLU, GELU**: the
+  reference's routines on the software binary64 (`ggml/src/ggml-det/det_soft_ops.h`, generated),
+  and every float multiply/add/divide/sqrt/max in those kernels on a software binary32 layer
+  (`dso_f*_bits`) so subnormals survive. `get_rows` of quantised tensors stays on the CPU.
+- The shader library is compiled with fast-math off. `ANOMLY_METAL_EXACT` is the only way Metal
+  is allowed on in this fork; ops without an exact kernel are declined by `supports_op`.
 
 Gates, all on the M4 Pro:
 
-- `tests/anomly/metal-bp8-unit.mm`: the Metal arithmetic against the same header compiled on
-  the host — f32→binary64 (65,536), block scale (2,048 blocks), nearest encode (65,536), whole
-  block quantiser (2,048), 256-bit readout (2,048): 0 mismatches.
-- `tests/anomly/test-metal-bposit8.cpp`: MUL_MAT(bposit8, f32) on the Metal backend against the
-  CPU backend, random shapes K ≤ 768, N ≤ 200, M ≤ 9: **0 / 161,364 mismatches** over 300 trials.
-- The whole-graph gate above with `-ngl 99`: the 5,140-line dump is **byte-identical** to the x86
-  dump (sha256 `b5303ed6bb0e9e82…`), same text.
+- `tests/anomly/metal_ops_gate.mm`: the software float ops **inside a Metal kernel** against the
+  same header on the host — mul/add/sub/div/sqrt/max, expf, tanhf, silu, f16→f32, and the
+  integer quire readout against the reference Horner: 2 × 10⁶ + 5 × 10⁵ cases, 0 mismatches.
+- `tests/anomly/test-metal-bposit8.cpp ops 200`: eleven ops on the Metal backend against the CPU
+  backend, random shapes, a subnormal-heavy input stream: rms_norm (+mul), soft_max (f16 mask,
+  plain), rope (norm, neox), swiglu, silu, gelu, mul_mat f16 (contiguous, permuted): **all 0
+  mismatches** (636,384 elements per elementwise op); the b-posit8 matmul gate 0 / 8,288.
+- Whole-graph dumps (`INVAR_LOGITS_OUT`, layer-1 matmuls, logits, tokens) with `-ngl 99` against
+  the x86 dumps, compared tensor-by-tensor and as `LC_ALL=C sort | sha256sum` (the Metal graph
+  optimizer schedules Qcur_rope/Kcur_rope after Vcur, so the raw line order differs; nothing
+  else does):
 
-The host-side software double is itself gated against hardware double on 2 × 10⁸ cases and the
-integer/soft-double b-posit8 path against `libggml-cpu` on 3 × 10⁵ rows (both on Linux; sources in
-the Anomly `space-time` repo, `research/metal-exact/`).
+  | model | lines | sorted sha256 (x86 == M4 GPU) | text |
+  |---|---|---|---|
+  | SmolLM2-135M-Instruct b-posit8 | 5,140 | 68edecdc52a5e19e… | identical |
+  | Qwen2.5-0.5B-Instruct b-posit8 | 4,840 | ea35e8c5422b36cc… | identical |
+  | Llama-3.2-1B-Instruct b-posit8 | 2,760 | e5e923a1cff55347… | identical |
 
-Speed, SmolLM2-135M (`llama-bench -p 256 -n 64 -t 8`): Metal build pp256 **90.6** t/s, tg64
-**16.7** t/s; CPU exact build pp256 74.6, tg64 54.7. Prompt processing gains from the GPU matmuls;
-single-token generation is 3.3× slower than the CPU build because every declined op is a
-CPU↔GPU hand-off. Moving RMSNorm, softmax, RoPE and the
-activations onto the GPU with the same software-double discipline is the next step; the f16
-attention matmuls would follow the same accumulate-and-read-out pattern.
+Two things the port found that matter beyond this fork. (1) A heavy thread-0-only block followed
+by a threadgroup barrier and a broadcast miscompiled on the M4 Pro (threads 1..31 never executed
+the kernel tail); the softmax kernel now keeps its tail uniform. (2) The subnormal flush above: a
+"safe" math mode is not IEEE on Apple GPUs, so any bit-exactness claim for a Metal kernel that
+uses float hardware needs a subnormal test.
+
+Speed (`llama-bench -p 256 -n 64 -fa 0`, M4 Pro 14-core, tokens/s, GPU = `-ngl 99`, CPU = the
+same build with `-ngl 0`):
+
+| model | GPU pp256 | GPU tg64 | CPU -t 8 pp256 | CPU -t 8 tg64 |
+|---|---|---|---|---|
+| SmolLM2-135M | 125.9 | 43.6 (-t 4) / 42.4 (-t 8) | 108.9 | 55.2 |
+| Qwen2.5-0.5B | 61.0 | 25.2 | 59.9 | 18.8 |
+| Llama-3.2-1B | 28.0 | 16.0 | 27.7 | 8.8 |
+
+Prompt processing is compute-bound in the exact matvec on both sides and lands within a few percent
+either way; single-token generation on the GPU is 1.3× (0.5B) and 1.8× (1B) the 8-thread CPU rate,
+and loses to 8 threads only on the 135M model, where ~750 dependent dispatches per token dominate.
+Nothing here is tuned for throughput yet (one simdgroup per output, no simdgroup matrix units).
