@@ -159,6 +159,7 @@ kernel void kernel_mul_mv_bposit8_exact(
         device const block_bposit8 * y,
         device float * dst,
         threadgroup short * tab [[threadgroup(0)]],     // 256 x (M << 8 | E & 0xFF): the decode table, threadgroup-resident
+        threadgroup long * tgacc [[threadgroup(1)]],    // per-lane 8 limbs, interleaved [sg][w][lane] (see below)
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -172,8 +173,12 @@ kernel void kernel_mul_mv_bposit8_exact(
     const long i2 = tgpig.z % args.ne12, i3 = tgpig.z / args.ne12;
     device const block_bposit8 * xr = x + (i3 / args.r3) * args.s03 + (i2 / args.r2) * args.s02 + row * args.s01;
     device const block_bposit8 * yr = y + i3 * args.s13 + i2 * args.s12 + i1 * args.s11;
-    long a[8];
-    for (int w = 0; w < 8; w++) a[w] = 0;
+    // the limb index of each product is data-dependent; a dynamically indexed private array is
+    // demoted to slow memory on Apple GPUs (measured 2.9x of the kernel's time), so the lazily
+    // carried limbs live in threadgroup memory, limb-major so lanes hit consecutive words
+    threadgroup long * a0 = tgacc + (int) sgitg * 8 * 32 + lane;
+#define BP8_A(w) a0[(w) * 32]
+    for (int w = 0; w < 8; w++) BP8_A(w) = 0;
     for (int ib = lane; ib < args.nblk; ib += 32) {
         const int se = (int) xr[ib].scale_exp + (int) yr[ib].scale_exp + BP8_QFRAC;
         device const uchar * qx = xr[ib].qs;
@@ -182,12 +187,18 @@ kernel void kernel_mul_mv_bposit8_exact(
             const short tx = tab[qx[j]], ty = tab[qy[j]];
             const int P = (int) (tx >> 8) * (int) (ty >> 8);
             if (P == 0) continue;
-            bp8_lane_add(a, (long) P, (int) (char) tx + (int) (char) ty + se);
+            // == bp8_lane_add(a, P, sh) on the threadgroup limbs (sh >= 48 here: w >= 1)
+            const int sh = (int) (char) tx + (int) (char) ty + se;
+            const int w = sh >> 5, bits = sh & 31;
+            const long V = (long) P << bits;
+            BP8_A(w) += (long) (uint) V;
+            if (w + 1 < 8) BP8_A(w + 1) += (V >> 32);
         }
     }
     // simdgroup reduction of the 8 limbs by butterfly shuffles (two's complement wraps correctly)
     long s[8];
-    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) a[w], tiisg);
+    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) BP8_A(w), tiisg);
+#undef BP8_A
     if (lane != 0) return;
     uint q[8];
     bp8_limbs_to_q256(s, q);
@@ -246,6 +257,7 @@ kernel void kernel_mul_mv_f16_exact(
         device const ushort * x,
         device const ushort * y,
         device float * dst,
+        threadgroup long * tgacc [[threadgroup(0)]],    // per-lane 8 limbs, interleaved [sg][w][lane]
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -256,18 +268,24 @@ kernel void kernel_mul_mv_f16_exact(
     const long i2 = tgpig.z % args.ne12, i3 = tgpig.z / args.ne12;
     device const ushort * xr = x + (i3 / args.r3) * args.s03 + (i2 / args.r2) * args.s02 + row * args.s01;
     device const ushort * yr = y + i3 * args.s13 + i2 * args.s12 + i1 * args.s11;
-    long a[8];
-    for (int w = 0; w < 8; w++) a[w] = 0;
+    threadgroup long * a0 = tgacc + (int) sgitg * 8 * 32 + lane;
+#define BP8_A(w) a0[(w) * 32]
+    for (int w = 0; w < 8; w++) BP8_A(w) = 0;
     for (int k = lane; k < args.nblk; k += 32) {
         int Mx, Ex, My, Ey;
         dso_f16_to_ME(xr[k], &Mx, &Ex);
         dso_f16_to_ME(yr[k], &My, &Ey);
         const int P = Mx * My;
         if (P == 0) continue;
-        bp8_lane_add(a, (long) P, Ex + Ey + BP8_QFRAC);
+        const int sh = Ex + Ey + BP8_QFRAC;                    // in [48, 106]: w in [1, 3]
+        const int w = sh >> 5, bits = sh & 31;
+        const long V = (long) P << bits;
+        BP8_A(w) += (long) (uint) V;
+        BP8_A(w + 1) += (V >> 32);
     }
     long s[8];
-    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) a[w], tiisg);
+    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) BP8_A(w), tiisg);
+#undef BP8_A
     if (lane != 0) return;
     uint q[8];
     bp8_limbs_to_q256(s, q);

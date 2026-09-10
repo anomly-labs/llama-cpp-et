@@ -106,10 +106,10 @@ static double bench_op(ggml_backend_t be, const char * label, int variant, int r
     std::vector<ggml_tensor *> ins;
     for (int c = 0; c < copies; c++) {
         ggml_tensor * y = nullptr;
-        if (variant == 0 || variant == 1 || variant == 2) {    // bposit8 matvec: 576->1536, 1536->576, 576->49152 (lm_head)
-            const int K = variant == 1 ? 1536 : 576, N = variant == 0 ? 1536 : (variant == 1 ? 576 : 49152);
+        if (variant == 0 || variant == 1 || variant == 2 || variant == 9) {    // bposit8 matvec: 576->1536, 1536->576, 576->49152 (lm_head); 9 = prefill 576->1536 x 64 tokens
+            const int K = variant == 1 ? 1536 : 576, N = variant == 0 || variant == 9 ? 1536 : (variant == 1 ? 576 : 49152);
             ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_BPOSIT8, K, N);
-            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, variant == 9 ? 64 : 1);
             ins.push_back(w); ins.push_back(x); y = ggml_mul_mat(ctx, w, x);
         }
         if (variant == 3) {                                    // KQ: k [64, n_kv=128, 3] x q [64, 1, 9]
@@ -154,8 +154,9 @@ int main(int argc, char ** argv) {
         ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         ggml_backend_cpu_set_n_threads(cpu, 4);
-        const char * names[9] = { "bp8 mv 576->1536", "bp8 mv 1536->576", "bp8 mv 576->49152", "f16 KQ 64x128 9h", "f16 KQV 128x64 9h", "softmax 128x9", "rms_norm+mul 576", "rope neox 64x9", "swiglu 1536" };
-        for (int v = 0; v < 9; v++) { const int copies = v == 2 ? 4 : 32; bench_op(cpu, names[v], v, 5, copies); bench_op(gpu, names[v], v, 5, copies); }
+        const char * names[10] = { "bp8 mv 576->1536", "bp8 mv 1536->576", "bp8 mv 576->49152", "f16 KQ 64x128 9h", "f16 KQV 128x64 9h", "softmax 128x9", "rms_norm+mul 576", "rope neox 64x9", "swiglu 1536", "bp8 mm 576->1536 x64" };
+        const int only = argc > 2 ? atoi(argv[2]) : -1;
+        for (int v = 0; v < 10; v++) { if (only >= 0 && v != only) continue; const int copies = (v == 2 || v == 9) ? 4 : 32; bench_op(cpu, names[v], v, 5, copies); bench_op(gpu, names[v], v, 5, copies); }
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "ops") == 0) {
