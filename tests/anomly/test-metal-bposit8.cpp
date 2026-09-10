@@ -98,7 +98,66 @@ static long gate_op(ggml_backend_t cpu, ggml_backend_t gpu, const char * label, 
     return bad;
 }
 
+// per-op timing at SmolLM2-135M decode shapes (n_embd 576, ffn 1536, head 64, 9 heads / 3 kv heads, vocab 49152)
+static double bench_op(ggml_backend_t be, const char * label, int variant, int reps, int copies) {
+    ggml_init_params ip = { 256 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    std::vector<ggml_tensor *> ins;
+    for (int c = 0; c < copies; c++) {
+        ggml_tensor * y = nullptr;
+        if (variant == 0 || variant == 1 || variant == 2) {    // bposit8 matvec: 576->1536, 1536->576, 576->49152 (lm_head)
+            const int K = variant == 1 ? 1536 : 576, N = variant == 0 ? 1536 : (variant == 1 ? 576 : 49152);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_BPOSIT8, K, N);
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+            ins.push_back(w); ins.push_back(x); y = ggml_mul_mat(ctx, w, x);
+        }
+        if (variant == 3) {                                    // KQ: k [64, n_kv=128, 3] x q [64, 1, 9]
+            ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 64, 128, 3);
+            ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 1, 9);
+            ins.push_back(k); ins.push_back(q); y = ggml_mul_mat(ctx, k, q);
+        }
+        if (variant == 4) {                                    // KQV: v [128, 64, 3] x kq [128, 1, 9]
+            ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, 64, 3);
+            ggml_tensor * kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, 9);
+            ins.push_back(v); ins.push_back(kq); y = ggml_mul_mat(ctx, v, kq);
+        }
+        if (variant == 5) { ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, 9); ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, 1); ins.push_back(x); ins.push_back(m); y = ggml_soft_max_ext(ctx, x, m, 0.125f, 0.0f); }
+        if (variant == 6) { ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 576, 1); ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 576); ins.push_back(x); ins.push_back(w); y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-5f), w); }
+        if (variant == 7) { ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 9, 1); ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ins.push_back(x); ins.push_back(pos); y = ggml_rope_ext(ctx, x, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 8192, 100000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); }
+        if (variant == 8) { ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1536, 1); ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1536, 1); ins.push_back(x); ins.push_back(g); y = ggml_swiglu_split(ctx, x, g); }
+        ggml_build_forward_expand(gf, y);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    for (ggml_tensor * t : ins) {                               // deterministic fill; bposit8 rows get small codes + scale 0
+        std::vector<uint8_t> bytes(ggml_nbytes(t));
+        if (t->type == GGML_TYPE_I32) { memset(bytes.data(), 0, bytes.size()); }
+        else if (t->type == GGML_TYPE_BPOSIT8) { for (size_t i = 0; i < bytes.size(); i++) bytes[i] = (i % 33 == 0) ? 0 : (uint8_t) (0x30 + (r64() % 64)); }
+        else if (t->type == GGML_TYPE_F16) { for (size_t i = 0; i + 1 < bytes.size(); i += 2) { uint16_t h = ggml_fp32_to_fp16(rf() * 0.01f); memcpy(&bytes[i], &h, 2); } }
+        else { for (size_t i = 0; i + 3 < bytes.size(); i += 4) { float f = rf() * 0.01f; memcpy(&bytes[i], &f, 4); } }
+        ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+    }
+    // warm-up: pipeline compile + let the GPU clock ramp (DVFS makes short bursts look slow)
+    { const int64_t tw = ggml_time_us(); while (ggml_time_us() - tw < 400000) ggml_backend_graph_compute(be, gf); }
+    const int64_t t0 = ggml_time_us();
+    int done = 0;
+    while (done < reps || ggml_time_us() - t0 < 300000) { ggml_backend_graph_compute(be, gf); done++; }
+    const double us = (double) (ggml_time_us() - t0) / ((double) done * copies);
+    printf("BENCH %-22s %-4s %9.1f us/op\n", label, ggml_backend_name(be), us);
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    return us;
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "bench") == 0) {
+        ggml_backend_load_all();
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        ggml_backend_cpu_set_n_threads(cpu, 4);
+        const char * names[9] = { "bp8 mv 576->1536", "bp8 mv 1536->576", "bp8 mv 576->49152", "f16 KQ 64x128 9h", "f16 KQV 128x64 9h", "softmax 128x9", "rms_norm+mul 576", "rope neox 64x9", "swiglu 1536" };
+        for (int v = 0; v < 9; v++) { const int copies = v == 2 ? 4 : 32; bench_op(cpu, names[v], v, 5, copies); bench_op(gpu, names[v], v, 5, copies); }
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "ops") == 0) {
         ggml_backend_load_all();
         ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

@@ -109,6 +109,14 @@ private:
     int idx_start;
     int idx_end;
 
+public:
+    // exact b-posit8 matmul: the quantised src1 of the previous node is reused when the next node
+    // is a b-posit8 matmul on the same src1 (Q/K/V projections, gate/up): one quantise dispatch
+    // instead of three / two. The scratch lives behind that node's dst, which is still alive.
+    int                  bp8_last_idx  = -1;
+    const ggml_tensor *  bp8_last_src1 = nullptr;
+    ggml_metal_buffer_id bp8_last_tmp  = {};
+
     // non-empty node indices
     std::vector<int> idxs;
 };
@@ -2133,13 +2141,11 @@ static int ggml_metal_op_mul_mat_f16_exact(ggml_metal_op_t ctx, int idx) {
             /*.r2   =*/ (int32_t) (ne12 / ne02),
             /*.r3   =*/ (int32_t) (ne13 / ne03),
         };
-        const size_t smem = (size_t) nsg * 32 * 8 * sizeof(int64_t);
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nsg - 1) / nsg, ne11, ne12 * ne13, 32, nsg, 1);
     }
     return 1;
@@ -2178,13 +2184,18 @@ int ggml_metal_op_mul_mat_bposit8(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_tmp = bid_dst;                   // quantised src1 lives behind dst
     bid_tmp.offs += ggml_nbytes(op);
+    const bool reuse_q = ctx->bp8_last_idx == idx - 1 && ctx->bp8_last_src1 == op->src[1];
+    if (reuse_q) bid_tmp = ctx->bp8_last_tmp;
+    ctx->bp8_last_idx  = idx;
+    ctx->bp8_last_src1 = op->src[1];
+    ctx->bp8_last_tmp  = bid_tmp;
     if (getenv("GGML_BP8_DEBUG")) {
         fprintf(stderr, "[bp8-metal] %s: ne00=%d ne01=%d ne11=%d ne12=%d ne13=%d nblk=%lld nblk_total=%lld dst.offs=%zu tmp.offs=%zu src1.offs=%zu\n",
                 op->name, ne00, ne01, ne11, ne12, ne13, (long long) nblk, (long long) nblk_total, bid_dst.offs, bid_tmp.offs, bid_src1.offs);
     }
 
-    {
-        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_quantize_bposit8_f32");
+    if (!reuse_q) {
+        auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_quantize_bposit8_f32_sg");
         ggml_metal_kargs_bp8_quant args = {
             /*.nblk_row   =*/ nblk,
             /*.ne1        =*/ ne11,
@@ -2194,15 +2205,17 @@ int ggml_metal_op_mul_mat_bposit8(ggml_metal_op_t ctx, int idx) {
             /*.s3         =*/ (int64_t) (nb13 / sizeof(float)),
             /*.nblk_total =*/ nblk_total,
         };
-        const int nth = 128;
+        const int nsg = 4;                                     // BP8_NSG: blocks per threadgroup, one simdgroup each
+        const size_t smem = 255 * sizeof(uint64_t) + 256 * sizeof(uint32_t);   // threadgroup-resident code tables
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
         ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (nblk_total + nth - 1) / nth, 1, 1, nth, 1, 1);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (nblk_total + nsg - 1) / nsg, 1, 1, 32, nsg, 1);
+        // the encoder dispatches concurrently: the matmul must see the quantised src1
+        ggml_metal_encoder_memory_barrier(enc);
     }
-    // the encoder dispatches concurrently: the matmul must see the quantised src1
-    ggml_metal_encoder_memory_barrier(enc);
     {
         auto pipeline = ggml_metal_library_get_pipeline_bposit8(lib, "kernel_mul_mv_bposit8_exact");
         const int nsg = 4;                                     // BP8_NSG in the shader
@@ -2222,7 +2235,7 @@ int ggml_metal_op_mul_mat_bposit8(ggml_metal_op_t ctx, int idx) {
             /*.r2   =*/ (int32_t) (ne12 / ne02),
             /*.r3   =*/ (int32_t) (ne13 / ne03),
         };
-        const size_t smem = (size_t) nsg * 32 * 8 * sizeof(int64_t);
+        const size_t smem = 256 * sizeof(int16_t);             // threadgroup-resident decode table
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);

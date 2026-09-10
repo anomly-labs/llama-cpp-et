@@ -82,6 +82,75 @@ kernel void kernel_quantize_bposit8_f32(
     for (int j = 0; j < BP8_QK; j++) yb->qs[j] = (uchar) qs[j];
 }
 
+// simdgroup quantise: one simdgroup per 32-element block, one lane per element. The block scale
+// needs the exact sum of squares: each lane adds its square into a 20-limb accumulator, the
+// limbs are summed across the simdgroup (butterfly, every lane gets the total) and
+// carry-normalised, then each lane encodes its own element. Same results as the one-thread
+// kernel above (bp8_ss_add_sq / bp8_ss_finish are the pieces of bp8_scale_exp_exact_bits).
+// nearest-code search on threadgroup-resident tables (the constant-memory search serialises on
+// divergent addresses); same code as bp8_encode_nearest_soft
+static inline uint bp8_encode_nearest_tg(ulong x, threadgroup const ulong * sv, threadgroup const uint * sc) {
+    if ((x & 0x7FFFFFFFFFFFFFFFul) == 0) return BP8_ZERO;
+    int lo = 0, hi = 255;
+    while (lo < hi) { const int mid = (lo + hi) >> 1; if (ds_lt(sv[mid], x)) lo = mid + 1; else hi = mid; }
+    int best_k = -1; ulong bestd = 0x7FF0000000000000ul;
+    const int start = lo > 0 ? lo - 1 : lo, end = lo < 255 ? lo : lo - 1;
+    for (int k = start; k <= end; k++) {
+        const ulong d = ds_fabs(ds_sub(sv[k], x));
+        if (ds_lt(d, bestd) || (ds_eq(d, bestd) && (best_k < 0 || sc[k] < sc[best_k]))) { bestd = d; best_k = k; }
+    }
+    if (best_k < 0 || !ds_lt(bestd, ds_fabs(x))) return BP8_ZERO;
+    return sc[best_k];
+}
+static inline ulong bp8_simd_sum_u64(ulong v, ushort tiisg) {      // 64-bit butterfly sum via two 32-bit shuffles
+    for (ushort off = 16; off > 0; off >>= 1) {
+        const uint lo = simd_shuffle_xor((uint) v, off);
+        const uint hi = simd_shuffle_xor((uint) (v >> 32), off);
+        v += ((ulong) hi << 32) | lo;
+    }
+    return v;
+}
+kernel void kernel_quantize_bposit8_f32_sg(
+        constant ggml_metal_kargs_bp8_quant & args,
+        device const float * x,
+        device block_bposit8 * y,
+        threadgroup ulong * tabs [[threadgroup(0)]],               // sv[255] then sc[256] (as uint)
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint * tsc = (threadgroup uint *) (tabs + 255);
+    for (int i = (int) sgitg * 32 + tiisg; i < 255; i += BP8_NSG * 32) { tabs[i] = bp8_tab_sv[i]; tsc[i] = bp8_tab_sc[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const long b = (long) tgpig.x * BP8_NSG + sgitg;
+    if (b >= args.nblk_total) return;                              // whole simdgroup leaves together
+    const long ib = b % args.nblk_row;
+    long r = b / args.nblk_row;
+    const long i1 = r % args.ne1; r /= args.ne1;
+    const long i2 = r % args.ne2;
+    const long i3 = r / args.ne2;
+    const uint xb = as_type<uint>(x[i3 * args.s3 + i2 * args.s2 + i1 * args.s1 + ib * BP8_QK + tiisg]);
+    uint acc[BP8_SS_LIMBS];
+    for (int i = 0; i < BP8_SS_LIMBS; i++) acc[i] = 0;
+    const int rr = bp8_ss_add_sq(acc, xb);
+    const int nonfinite = simd_any(rr < 0);
+    const int any       = simd_any(rr > 0);
+    int se = 0;
+    if (!nonfinite && any) {
+        uint tot[BP8_SS_LIMBS];
+        ulong carry = 0;
+        for (int i = 0; i < BP8_SS_LIMBS; i++) {                   // per-limb sums < 32 * 2^32: no overflow
+            const ulong t = bp8_simd_sum_u64((ulong) acc[i], tiisg) + carry;
+            tot[i] = (uint) t; carry = t >> 32;
+        }
+        se = bp8_ss_finish(tot);
+    }
+    const ulong xd = ds_ldexp(ds_from_f32bits(xb), -se);           // exact
+    const uint code = bp8_encode_nearest_tg(xd, tabs, tsc);
+    device block_bposit8 * yb = y + b;
+    if (tiisg == 0) yb->scale_exp = (char) se;
+    yb->qs[tiisg] = (uchar) code;
+}
+
 // exact dot: one simdgroup per output element; lanes stride the blocks; 8 int64 limbs per lane
 // summed through threadgroup memory, carry-normalised once, read out through the software double
 kernel void kernel_mul_mv_bposit8_exact(
@@ -89,11 +158,14 @@ kernel void kernel_mul_mv_bposit8_exact(
         device const block_bposit8 * x,
         device const block_bposit8 * y,
         device float * dst,
-        threadgroup long * red [[threadgroup(0)]],
+        threadgroup short * tab [[threadgroup(0)]],     // 256 x (M << 8 | E & 0xFF): the decode table, threadgroup-resident
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     const int  lane = tiisg;
+    // constant-memory lookups with divergent indices serialise; copy the table to threadgroup memory
+    for (int i = (int) sgitg * 32 + lane; i < 256; i += BP8_NSG * 32) tab[i] = (short) ((bp8_tab_M[i] << 8) | (bp8_tab_E[i] & 0xFF));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const long row  = (long) tgpig.x * BP8_NSG + sgitg;
     if (row >= args.ne01) return;                              // the whole simdgroup leaves together
     const long i1 = tgpig.y;
@@ -104,22 +176,22 @@ kernel void kernel_mul_mv_bposit8_exact(
     for (int w = 0; w < 8; w++) a[w] = 0;
     for (int ib = lane; ib < args.nblk; ib += 32) {
         const int se = (int) xr[ib].scale_exp + (int) yr[ib].scale_exp + BP8_QFRAC;
+        device const uchar * qx = xr[ib].qs;
+        device const uchar * qy = yr[ib].qs;
         for (int j = 0; j < BP8_QK; j++) {
-            const uint cx = xr[ib].qs[j], cy = yr[ib].qs[j];
-            const int P = bp8_tab_M[cx] * bp8_tab_M[cy];
+            const short tx = tab[qx[j]], ty = tab[qy[j]];
+            const int P = (int) (tx >> 8) * (int) (ty >> 8);
             if (P == 0) continue;
-            bp8_lane_add(a, (long) P, bp8_tab_E[cx] + bp8_tab_E[cy] + se);
+            bp8_lane_add(a, (long) P, (int) (char) tx + (int) (char) ty + se);
         }
     }
-    threadgroup long * r = red + ((int) sgitg * 32) * 8;
-    for (int w = 0; w < 8; w++) r[lane * 8 + w] = a[w];
-    metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
-    if (lane != 0) return;
+    // simdgroup reduction of the 8 limbs by butterfly shuffles (two's complement wraps correctly)
     long s[8];
-    for (int w = 0; w < 8; w++) { long t = 0; for (int l = 0; l < 32; l++) t += r[l * 8 + w]; s[w] = t; }
+    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) a[w], tiisg);
+    if (lane != 0) return;
     uint q[8];
     bp8_limbs_to_q256(s, q);
-    const uint out = bp8_q256_to_f32bits(q);
+    const uint out = bp8_q256_to_f32bits_fast(q);
     dst[i3 * args.sd3 + i2 * args.sd2 + i1 * args.sd1 + row] = as_type<float>(out);
 }
 
@@ -174,7 +246,6 @@ kernel void kernel_mul_mv_f16_exact(
         device const ushort * x,
         device const ushort * y,
         device float * dst,
-        threadgroup long * red [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -195,15 +266,12 @@ kernel void kernel_mul_mv_f16_exact(
         if (P == 0) continue;
         bp8_lane_add(a, (long) P, Ex + Ey + BP8_QFRAC);
     }
-    threadgroup long * r = red + ((int) sgitg * 32) * 8;
-    for (int w = 0; w < 8; w++) r[lane * 8 + w] = a[w];
-    metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
-    if (lane != 0) return;
     long s[8];
-    for (int w = 0; w < 8; w++) { long t = 0; for (int l = 0; l < 32; l++) t += r[l * 8 + w]; s[w] = t; }
+    for (int w = 0; w < 8; w++) s[w] = (long) bp8_simd_sum_u64((ulong) a[w], tiisg);
+    if (lane != 0) return;
     uint q[8];
     bp8_limbs_to_q256(s, q);
-    const uint out = bp8_q256_to_f32bits(q);
+    const uint out = bp8_q256_to_f32bits_fast(q);
     dst[i3 * args.sd3 + i2 * args.sd2 + i1 * args.sd1 + row] = as_type<float>(out);
 }
 
