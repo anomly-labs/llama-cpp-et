@@ -93,7 +93,8 @@ Gates, all on the M4 Pro:
 
 A ~500-token prompt (`-c 2048 -n 16`, SmolLM2-135M, 9,759-line dump) gives the same sorted digest
 on x86 and on the M4 GPU at `-t 4` and `-t 1` (4ff052bc5e3789da…): the attention kernels at a
-few hundred positions match, and the CPU thread count does not enter the result.
+few hundred positions match, and the CPU thread count does not enter the result. The same prompt
+on Llama-3.2-1B (grouped-query attention, 5,237-line dump): 0413a484a93d0843… on both.
 
 The receipts follow: `invar serve --binary build-metal/bin/llama-cli --device MTL0 --ngl 99`
 mints receipts on the GPU, and `invar verify --cross-deployment --device none --ngl 0` re-executes
