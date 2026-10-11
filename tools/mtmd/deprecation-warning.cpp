@@ -1,6 +1,7 @@
 #include <clocale>
 #include <cstdio>
 #include <string>
+#include <cstdlib>
 
 int main(int argc, char** argv) {
     std::setlocale(LC_NUMERIC, "C");
