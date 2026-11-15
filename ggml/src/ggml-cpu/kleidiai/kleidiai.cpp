@@ -33,6 +33,7 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #include <excpt.h>
+#include <cstdlib>
 #endif
 
 #include "kleidiai.h"

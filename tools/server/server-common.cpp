@@ -13,6 +13,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <errno.h>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;

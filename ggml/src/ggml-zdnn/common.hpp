@@ -8,6 +8,7 @@
 
 #include <vector>
 #include <memory>
+#include <cstdlib>
 
 #define GGML_ZDNN_NAME    "zDNN"
 #define GGML_ZDNN_VERSION ZDNN_VERNUM

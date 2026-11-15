@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <cstdlib>
 
 // Main
 int main(int argc, char** argv) {
