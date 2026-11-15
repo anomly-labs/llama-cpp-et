@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <cstdlib>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
