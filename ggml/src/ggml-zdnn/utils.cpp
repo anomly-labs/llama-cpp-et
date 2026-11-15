@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include <cstdlib>
 #include "utils.hpp"
 
 zdnn_data_types ggml_zdnn_type_mapping(ggml_type type) {

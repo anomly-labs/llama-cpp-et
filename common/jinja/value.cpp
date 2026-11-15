@@ -11,6 +11,7 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <cstdlib>
 
 #define FILENAME "jinja-value"
 

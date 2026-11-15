@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <unordered_set>
 #include <functional>
+#include <cstdlib>
+#include <cerrno>
 
 namespace fs = std::filesystem;
 

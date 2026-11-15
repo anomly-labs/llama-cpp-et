@@ -26,6 +26,7 @@
 #  include <time.h>
 #  ifndef _WIN32
 #    include <poll.h>
+#include <cerrno>
 #  endif
 #endif // GGML_RPC_RDMA
 

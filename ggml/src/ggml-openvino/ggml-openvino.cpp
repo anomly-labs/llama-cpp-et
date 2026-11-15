@@ -33,6 +33,7 @@
 #    include <windows.h>
 #else
 #    include <unistd.h>
+#include <cerrno>
 #endif
 
 // =====================================================
