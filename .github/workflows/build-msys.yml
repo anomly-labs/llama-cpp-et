@@ -4,9 +4,8 @@ on:
   # only manual triggers due to low-importance of the workflows
   # TODO: for regular runs, provision dedicated self-hosted runners
   workflow_dispatch:
-  # run once every week
-  schedule:
-    - cron: '0 0 * * 0'
+  # Anomly fork: no weekly schedule. A scheduled run tests nothing this fork changed; it only
+  # re-tests external downloads, and that is what produced the failure mails. Run by hand or on push.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}

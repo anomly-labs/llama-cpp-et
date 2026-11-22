@@ -17,12 +17,23 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
+# Anomly fork: the prebuilt UI archive is pinned to the upstream build this fork is based on.
+# Upstream derives the version from the git build number and, when that archive does not exist,
+# falls back to "latest". In this fork the build number never matches an upstream archive (and is
+# 0 in shallow CI checkouts), so every build silently took "latest", which stops matching the
+# asset list tools/ui/embed.cpp expects as soon as upstream changes its UI. Update the pin when
+# the fork is rebased onto a newer upstream build (see docs/anomly/ui-assets-pin.md).
+set(LLAMA_UI_PINNED_VERSION "b10036" CACHE STRING "Prebuilt UI archive version to download (empty = derive from the build number)")
+option(LLAMA_UI_ALLOW_LATEST "llama: fall back to the newest upstream UI archive when the wanted version is unavailable" OFF)
+
+# Resolve HF asset version: explicit env var > fork pin > derived from build number > unset
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
+elseif(NOT "${LLAMA_UI_PINNED_VERSION}" STREQUAL "")
+    set(HF_UI_VERSION "${LLAMA_UI_PINNED_VERSION}")
 elseif(DEFINED LLAMA_BUILD_NUMBER)
     set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
@@ -82,6 +93,7 @@ add_custom_target(llama-ui-assets ALL
         "-DHF_BUCKET=${LLAMA_UI_HF_BUCKET}"
         "-DHF_VERSION=${HF_UI_VERSION}"
         "-DHF_ENABLED=${LLAMA_USE_PREBUILT_UI}"
+        "-DHF_ALLOW_LATEST=${LLAMA_UI_ALLOW_LATEST}"
         "-DBUILD_UI=${LLAMA_BUILD_UI}"
         "-DLLAMA_UI_EMBED=${LLAMA_UI_EMBED_EXE}"
         "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"

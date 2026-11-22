@@ -14,6 +14,7 @@ set(LLAMA_SOURCE_DIR  "" CACHE STRING "Project source root (to resolve version f
 set(HF_BUCKET         "" CACHE STRING "Hugging Face bucket name")
 set(HF_VERSION        "" CACHE STRING "Version to download (empty = resolve from git)")
 set(HF_ENABLED        "" CACHE STRING "Whether to allow HF Bucket download (ON/OFF)")
+set(HF_ALLOW_LATEST   "" CACHE STRING "Fall back to the newest archive when the wanted version is unavailable (ON/OFF)")
 set(BUILD_UI          "" CACHE STRING "Build UI via npm (ON/OFF)")
 set(LLAMA_UI_EMBED    "" CACHE STRING "Path to llama-ui-embed helper")
 set(LLAMA_UI_GZIP     "" CACHE STRING "Apply gzip compress to assets to save bandwidth")
@@ -196,7 +197,11 @@ function(hf_download version out_var out_resolved)
     if(NOT "${version}" STREQUAL "")
         list(APPEND candidates "${version}")
     endif()
-    list(APPEND candidates "latest")
+    # Anomly fork: "latest" is a moving target that can stop matching this tree's embed tool,
+    # so it is only tried when asked for.
+    if(HF_ALLOW_LATEST)
+        list(APPEND candidates "latest")
+    endif()
 
     foreach(resolved ${candidates})
         set(base "https://huggingface.co/buckets/${HF_BUCKET}/resolve/${resolved}")
@@ -287,6 +292,17 @@ function(emit_files dist_dir)
         COMMAND "${LLAMA_UI_EMBED}" ${args}
         RESULT_VARIABLE rc
     )
+    if(NOT rc EQUAL 0 AND EXISTS "${dist_dir}/index.html")
+        # Anomly fork: assets that do not fit this tree's embed tool (for example a newer
+        # upstream UI archive) must not break the build; fall back to no embedded UI.
+        message(WARNING "UI: llama-ui-embed rejected the assets in ${dist_dir} (${rc}); "
+                        "building without an embedded UI")
+        file(REMOVE "${STAMP_FILE}")
+        execute_process(
+            COMMAND "${LLAMA_UI_EMBED}" "${UI_CPP}" "${UI_H}"
+            RESULT_VARIABLE rc
+        )
+    endif()
     if(NOT rc EQUAL 0)
         message(FATAL_ERROR "UI: llama-ui-embed failed (${rc})")
     endif()
