@@ -20,3 +20,12 @@ What this fork does instead:
 **When rebasing onto a newer upstream:** set `LLAMA_UI_PINNED_VERSION` in `tools/ui/CMakeLists.txt`
 to the new base build (the `bNNNNN` in the upstream release tag) and check that
 `https://huggingface.co/buckets/ggml-org/llama-ui/resolve/bNNNNN/dist.tar.gz.sha256` exists.
+
+## Windows Clang builds and the runner's STL
+
+The hosted Windows runner updates Visual Studio's STL and its preinstalled Clang separately. On
+22 Nov 2026 the STL began to require Clang 22 while the runner's Clang was older, and every
+Windows Clang job failed with `error STL1000: Unexpected compiler version`. The two toolchain
+files `cmake/x64-windows-llvm.cmake` and `cmake/arm64-windows-llvm.cmake` now define
+`_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`, so a runner image change of this kind no longer
+fails the build.
