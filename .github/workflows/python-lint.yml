@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   flake8-lint:
+    if: github.repository_owner == 'ggml-org'   # needs upstream's self-hosted runners; in a fork it would queue for a day and fail
     runs-on: [self-hosted, fast]
     name: Lint
     steps:

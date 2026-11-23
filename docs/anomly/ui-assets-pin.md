@@ -29,3 +29,14 @@ Windows Clang job failed with `error STL1000: Unexpected compiler version`. The 
 files `cmake/x64-windows-llvm.cmake` and `cmake/arm64-windows-llvm.cmake` now define
 `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`, so a runner image change of this kind no longer
 fails the build.
+
+## Jobs that need upstream's self-hosted runners
+
+Upstream runs many jobs on its own self-hosted machines. A fork has none, so those jobs queued
+for a day, were cancelled, and the workflow was reported as failed. In this fork every such job
+carries `if: github.repository_owner == 'ggml-org'` and is skipped. The packaging job that
+`CI (cpu)` waits on (`build-cmake-pkg.yml`) runs on a GitHub-hosted runner here. The daily
+schedule of `Publish Docker image` is removed; it can still be run on demand.
+
+When merging a newer upstream, re-apply the guard to any new job whose `runs-on` starts with
+`self-hosted`.
