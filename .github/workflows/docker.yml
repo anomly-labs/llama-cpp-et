@@ -16,9 +16,7 @@ on:
         description: "Skip the s390x build target (useful for fast test runs that do not need the IBM Z runner)"
         type: boolean
         default: false
-  schedule:
-    # Rebuild daily rather than on every push because it is expensive
-    - cron: '12 4 * * *'
+  # fork: the daily schedule is removed (it published nothing useful here and failed); run on demand
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}

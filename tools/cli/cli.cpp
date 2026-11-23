@@ -175,9 +175,9 @@ int llama_cli(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
     }
-    if (const char * logits_out = getenv("INVAR_LOGITS_OUT")) {
+    if (char * logits_out = getenv("INVAR_LOGITS_OUT")) {
         params.cb_eval           = invar_logits_cb;
-        params.cb_eval_user_data = (void *) logits_out;
+        params.cb_eval_user_data = logits_out;
     }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))

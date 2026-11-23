@@ -13,4 +13,5 @@ set( arch_c_flags "-march=armv8.7-a -fvectorize -ffp-model=fast -fno-finite-math
 set( warn_c_flags "-Wno-format -Wno-unused-variable -Wno-unused-function -Wno-gnu-zero-variadic-macro-arguments" )
 
 set( CMAKE_C_FLAGS_INIT   "${arch_c_flags} ${warn_c_flags}" )
-set( CMAKE_CXX_FLAGS_INIT "${arch_c_flags} ${warn_c_flags}" )
+# See x64-windows-llvm.cmake: accept a runner STL newer than the runner Clang (STL1000).
+set( CMAKE_CXX_FLAGS_INIT "${arch_c_flags} ${warn_c_flags} -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" )

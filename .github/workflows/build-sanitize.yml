@@ -28,6 +28,7 @@ env:
 
 jobs:
   ctest:
+    if: github.repository_owner == 'ggml-org'   # needs upstream's self-hosted runners; in a fork it would queue for a day and fail
     runs-on: [self-hosted, X64, CPU, Linux]
 
     continue-on-error: true

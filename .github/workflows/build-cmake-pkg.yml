@@ -5,8 +5,13 @@ on:
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, CPU]
+    # upstream runs this on a self-hosted runner; a fork has none, and CI (cpu) waits on this job
+    runs-on: ${{ github.repository_owner == 'ggml-org' && fromJSON('["self-hosted","Linux","CPU"]') || 'ubuntu-24.04' }}
     steps:
+      - name: Dependencies (hosted runner)
+        if: github.repository_owner != 'ggml-org'
+        run: sudo apt-get update && sudo apt-get install -y tcl
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0

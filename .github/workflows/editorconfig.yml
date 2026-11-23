@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   editorconfig:
+    if: github.repository_owner == 'ggml-org'   # needs upstream's self-hosted runners; in a fork it would queue for a day and fail
     runs-on: [self-hosted, fast]
     steps:
       - uses: actions/checkout@v6
